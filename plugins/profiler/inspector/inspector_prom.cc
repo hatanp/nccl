@@ -13,8 +13,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <inttypes.h>
+#include <algorithm>
 #include <map>
+#include <limits>
 #include <string>
+#include <vector>
 #include <cmath>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -29,9 +33,21 @@ extern const char* inspectorTimingSourceToString(inspectorTimingSource_t timingS
 
 extern const char* ncclFuncToString(ncclFunc_t fn);
 
+struct inspectorPromSlowEvent {
+  uint64_t sequence = 0;
+  uint64_t execTimeUsecs = 0;
+  uint64_t startTimestampUsecs = 0;
+  uint64_t stopTimestampUsecs = 0;
+  int peer = -1;
+};
+
 struct inspectorPromBucketAgg {
   uint64_t count = 0;
   double execTimeSum = 0.0;
+  uint64_t execTimeMin = std::numeric_limits<uint64_t>::max();
+  uint64_t execTimeMax = 0;
+  std::vector<uint64_t> execTimes;
+  std::vector<inspectorPromSlowEvent> slowest;
   double algoLogSum = 0.0;
   uint64_t algoCount = 0;
   double busLogSum = 0.0;
@@ -43,8 +59,12 @@ struct inspectorPromCollBucketKey {
   int nnodes;
   ncclFunc_t func;
   size_t msgSizeRangeBytes;
+  size_t msgSizeBytes;
+  int rank;
+  std::string commId;
   std::string commName;
   std::string algoProto;
+  std::string timingSource;
 
   bool operator<(const inspectorPromCollBucketKey& other) const {
     if (nranks != other.nranks) return nranks < other.nranks;
@@ -53,8 +73,12 @@ struct inspectorPromCollBucketKey {
     if (msgSizeRangeBytes != other.msgSizeRangeBytes) {
       return msgSizeRangeBytes < other.msgSizeRangeBytes;
     }
+    if (msgSizeBytes != other.msgSizeBytes) return msgSizeBytes < other.msgSizeBytes;
+    if (rank != other.rank) return rank < other.rank;
+    if (commId != other.commId) return commId < other.commId;
     if (commName != other.commName) return commName < other.commName;
-    return algoProto < other.algoProto;
+    if (algoProto != other.algoProto) return algoProto < other.algoProto;
+    return timingSource < other.timingSource;
   }
 };
 
@@ -63,7 +87,12 @@ struct inspectorPromP2pBucketKey {
   int nnodes;
   ncclFunc_t func;
   size_t msgSizeRangeBytes;
+  size_t msgSizeBytes;
+  int rank;
+  int peer;
+  std::string commId;
   std::string commName;
+  std::string timingSource;
 
   bool operator<(const inspectorPromP2pBucketKey& other) const {
     if (nranks != other.nranks) return nranks < other.nranks;
@@ -72,7 +101,12 @@ struct inspectorPromP2pBucketKey {
     if (msgSizeRangeBytes != other.msgSizeRangeBytes) {
       return msgSizeRangeBytes < other.msgSizeRangeBytes;
     }
-    return commName < other.commName;
+    if (msgSizeBytes != other.msgSizeBytes) return msgSizeBytes < other.msgSizeBytes;
+    if (rank != other.rank) return rank < other.rank;
+    if (peer != other.peer) return peer < other.peer;
+    if (commId != other.commId) return commId < other.commId;
+    if (commName != other.commName) return commName < other.commName;
+    return timingSource < other.timingSource;
   }
 };
 
@@ -86,26 +120,53 @@ struct inspectorPromDevice {
   FILE* file = nullptr;
   inspectorPromCollBucketMap collBuckets;
   inspectorPromP2pBucketMap p2pBuckets;
+  uint64_t collOverwritten = 0;
+  uint64_t p2pOverwritten = 0;
   bool hasData = false;
 };
-static const int kInspectorPromFormatMinor = 1;
+static const int kInspectorPromFormatMinor = 2;
 
 static void inspectorPromAggUpdate(inspectorPromBucketAgg& agg,
-                                   double algoBwGbs,
-                                   double busBwGbs,
-                                   uint64_t execTimeUsecs) {
+                                   const inspectorCompletedOpInfo& op) {
   agg.count++;
-  agg.execTimeSum += static_cast<double>(execTimeUsecs);
-  if (algoBwGbs > 0.0) {
+  agg.execTimeSum += static_cast<double>(op.execTimeUsecs);
+  agg.execTimeMin = std::min(agg.execTimeMin, op.execTimeUsecs);
+  agg.execTimeMax = std::max(agg.execTimeMax, op.execTimeUsecs);
+  agg.execTimes.push_back(op.execTimeUsecs);
+
+  inspectorPromSlowEvent event;
+  event.sequence = op.sn;
+  event.execTimeUsecs = op.execTimeUsecs;
+  event.startTimestampUsecs = op.evtTrk.evntTrace[NCCL_INSP_EVT_TRK_OP_START].ts;
+  event.stopTimestampUsecs = op.evtTrk.evntTrace[NCCL_INSP_EVT_TRK_OP_STOP].ts;
+  event.peer = op.peer;
+  agg.slowest.push_back(event);
+  std::sort(agg.slowest.begin(), agg.slowest.end(),
+            [](const inspectorPromSlowEvent& lhs, const inspectorPromSlowEvent& rhs) {
+              return lhs.execTimeUsecs > rhs.execTimeUsecs;
+            });
+  if (agg.slowest.size() > 4) agg.slowest.resize(4);
+
+  if (op.algoBwGbs > 0.0) {
     // Geometric mean trick: sum log(x), then exp(sum/count) later.
-    agg.algoLogSum += std::log(algoBwGbs);
+    agg.algoLogSum += std::log(op.algoBwGbs);
     agg.algoCount++;
   }
-  if (busBwGbs > 0.0) {
+  if (op.busBwGbs > 0.0) {
     // log(a*b*...)=sum(log(a)), so we accumulate logs for GM.
-    agg.busLogSum += std::log(busBwGbs);
+    agg.busLogSum += std::log(op.busBwGbs);
     agg.busCount++;
   }
+}
+
+static uint64_t inspectorPromPercentile(const std::vector<uint64_t>& values,
+                                        double percentile) {
+  if (values.empty()) return 0;
+  std::vector<uint64_t> sorted(values);
+  std::sort(sorted.begin(), sorted.end());
+  size_t index = static_cast<size_t>(std::ceil(percentile * sorted.size()));
+  if (index == 0) index = 1;
+  return sorted[std::min(index - 1, sorted.size() - 1)];
 }
 
 /*
@@ -136,12 +197,10 @@ static void inspectorPromFormatMessageSizeRange(size_t bytes,
 
   const char* units[] = {"B", "KB", "MB", "GB", "TB"};
   size_t unitIndex = 0;
-  double unitSize = 1.0;
   double byteValue = static_cast<double>(bytes);
 
   while (byteValue >= 1024.0 && unitIndex < 4) {
     byteValue /= 1024.0;
-    unitSize *= 1024.0;
     unitIndex++;
   }
 
@@ -230,33 +289,49 @@ static inspectorResult_t inspectorPromGetLabelsColl(char* labels,
                                                     size_t labelSize,
                                                     const char* nodeName,
                                                     const char* gpuName,
+                                                    const char* commId,
                                                     const char* commName,
                                                     const char* version,
+                                                    int rank,
                                                     int nranks,
                                                     int nnodes,
                                                     ncclFunc_t func,
                                                     const char* algoProto,
-                                                    size_t msgSizeRangeBytes) {
+                                                    size_t msgSizeRangeBytes,
+                                                    size_t msgSizeBytes,
+                                                    const char* timingSource) {
   const char* jobId = getenv("SLURM_JOB_ID");
+  const char* worldRank = getenv("SLURM_PROCID");
+  const char* localRank = getenv("SLURM_LOCALID");
   char msgSizeStr[32];
   inspectorPromFormatMessageSizeRange(msgSizeRangeBytes,
                                       msgSizeStr,
                                       sizeof(msgSizeStr));
 
   int ret = snprintf(labels, labelSize,
-                     "version=\"%s\",slurm_job_id=\"%s\",node=\"%s\",gpu=\"%s\","
-                     "comm_name=\"%s\",n_nodes=\"%d\",nranks=\"%d\","
-                     "collective=\"%s\",message_size=\"%s\",algo_proto=\"%s\"",
+                     "version=\"%s\",slurm_job_id=\"%s\",world_rank=\"%s\","
+                     "local_rank=\"%s\",node=\"%s\",gpu=\"%s\","
+                     "comm_id=\"%s\",comm_name=\"%s\",comm_rank=\"%d\","
+                     "n_nodes=\"%d\",nranks=\"%d\","
+                     "collective=\"%s\",message_size=\"%s\","
+                     "message_size_bytes=\"%zu\",algo_proto=\"%s\","
+                     "timing_source=\"%s\"",
                      (version && version[0]) ? version : "unknown",
                      jobId ? jobId : "unknown",
+                     worldRank ? worldRank : "unknown",
+                     localRank ? localRank : "unknown",
                      (nodeName && nodeName[0]) ? nodeName : "unknown",
                      (gpuName && gpuName[0]) ? gpuName : "unknown",
+                     (commId && commId[0]) ? commId : "unknown",
                      (commName && commName[0]) ? commName : "unknown",
+                     rank,
                      nnodes,
                      nranks,
                      ncclFuncToString(func),
                      msgSizeStr,
-                     algoProto ? algoProto : "unknown");
+                     msgSizeBytes,
+                     algoProto ? algoProto : "unknown",
+                     timingSource ? timingSource : "unknown");
 
   if (ret < 0 || (size_t)ret >= labelSize) {
     return inspectorMemoryError;
@@ -290,13 +365,20 @@ static inspectorResult_t inspectorPromGetLabelsP2p(char* labels,
                                                    size_t labelSize,
                                                    const char* nodeName,
                                                    const char* gpuName,
+                                                   const char* commId,
                                                    const char* commName,
                                                    const char* version,
+                                                   int rank,
+                                                   int peer,
                                                    int nranks,
                                                    int nnodes,
                                                    ncclFunc_t func,
-                                                   size_t msgSizeRangeBytes) {
+                                                   size_t msgSizeRangeBytes,
+                                                   size_t msgSizeBytes,
+                                                   const char* timingSource) {
   const char* jobId = getenv("SLURM_JOB_ID");
+  const char* worldRank = getenv("SLURM_PROCID");
+  const char* localRank = getenv("SLURM_LOCALID");
   char msgSizeStr[32];
   inspectorPromFormatMessageSizeRange(msgSizeRangeBytes,
                                       msgSizeStr,
@@ -304,18 +386,28 @@ static inspectorResult_t inspectorPromGetLabelsP2p(char* labels,
 
   int ret = snprintf(labels,
                      labelSize,
-                     "version=\"%s\",slurm_job_id=\"%s\",node=\"%s\",gpu=\"%s\","
-                     "comm_name=\"%s\",n_nodes=\"%d\",nranks=\"%d\","
-                     "p2p_operation=\"%s\",message_size=\"%s\"",
+                     "version=\"%s\",slurm_job_id=\"%s\",world_rank=\"%s\","
+                     "local_rank=\"%s\",node=\"%s\",gpu=\"%s\","
+                     "comm_id=\"%s\",comm_name=\"%s\",comm_rank=\"%d\","
+                     "peer=\"%d\",n_nodes=\"%d\",nranks=\"%d\","
+                     "p2p_operation=\"%s\",message_size=\"%s\","
+                     "message_size_bytes=\"%zu\",timing_source=\"%s\"",
                      (version && version[0]) ? version : "unknown",
                      jobId ? jobId : "unknown",
+                     worldRank ? worldRank : "unknown",
+                     localRank ? localRank : "unknown",
                      (nodeName && nodeName[0]) ? nodeName : "unknown",
                      (gpuName && gpuName[0]) ? gpuName : "unknown",
+                     (commId && commId[0]) ? commId : "unknown",
                      (commName && commName[0]) ? commName : "unknown",
+                     rank,
+                     peer,
                      nnodes,
                      nranks,
                      ncclFuncToString(func),
-                     msgSizeStr);
+                     msgSizeStr,
+                     msgSizeBytes,
+                     timingSource ? timingSource : "unknown");
 
   if (ret < 0 || (size_t)ret >= labelSize) {
     return inspectorMemoryError;
@@ -440,24 +532,47 @@ static inspectorResult_t inspectorPromWriteCollBucket(FILE* file,
                                      sizeof(labels),
                                      device.nodeName.c_str(),
                                      device.gpuName.c_str(),
+                                     key.commId.c_str(),
                                      key.commName.c_str(),
                                      version,
+                                     key.rank,
                                      key.nranks,
                                      key.nnodes,
                                      key.func,
                                      key.algoProto.c_str(),
-                                     key.msgSizeRangeBytes));
+                                     key.msgSizeRangeBytes,
+                                     key.msgSizeBytes,
+                                     key.timingSource.c_str()));
 
   double execMean = agg.count ? (agg.execTimeSum / agg.count) : 0.0;
   // GM = exp((1/n) * sum(log(x))) from log rules.
   double busMean = agg.busCount ? std::exp(agg.busLogSum / agg.busCount) : 0.0;
 
-  char buffer[2048];
+  uint64_t p50 = inspectorPromPercentile(agg.execTimes, 0.50);
+  uint64_t p95 = inspectorPromPercentile(agg.execTimes, 0.95);
+  uint64_t p99 = inspectorPromPercentile(agg.execTimes, 0.99);
+  uint64_t execMin = agg.count ? agg.execTimeMin : 0;
+
+  char buffer[8192];
   int written = snprintf(buffer, sizeof(buffer),
                          "nccl_bus_bandwidth_gbs{%s} %.6g\n"
-                         "nccl_collective_exec_time_microseconds{%s} %.6g\n",
+                         "nccl_collective_count{%s} %" PRIu64 "\n"
+                         "nccl_collective_exec_time_sum_microseconds{%s} %.6g\n"
+                         "nccl_collective_exec_time_microseconds{%s} %.6g\n"
+                         "nccl_collective_exec_time_min_microseconds{%s} %" PRIu64 "\n"
+                         "nccl_collective_exec_time_p50_microseconds{%s} %" PRIu64 "\n"
+                         "nccl_collective_exec_time_p95_microseconds{%s} %" PRIu64 "\n"
+                         "nccl_collective_exec_time_p99_microseconds{%s} %" PRIu64 "\n"
+                         "nccl_collective_exec_time_max_microseconds{%s} %" PRIu64 "\n",
                          labels, busMean,
-                         labels, execMean);
+                         labels, agg.count,
+                         labels, agg.execTimeSum,
+                         labels, execMean,
+                         labels, execMin,
+                         labels, p50,
+                         labels, p95,
+                         labels, p99,
+                         labels, agg.execTimeMax);
 
   if (written < 0 || (size_t)written >= sizeof(buffer)) {
     return inspectorMemoryError;
@@ -465,6 +580,19 @@ static inspectorResult_t inspectorPromWriteCollBucket(FILE* file,
 
   if (fwrite(buffer, 1, written, file) != (size_t)written) {
     return inspectorFileOpenError;
+  }
+
+  for (size_t i = 0; i < agg.slowest.size(); i++) {
+    const inspectorPromSlowEvent& event = agg.slowest[i];
+    written = snprintf(buffer, sizeof(buffer),
+                       "nccl_collective_slow_event_exec_time_microseconds{%s,"
+                       "top_index=\"%zu\",sequence=\"%" PRIu64 "\","
+                       "start_timestamp_us=\"%" PRIu64 "\","
+                       "stop_timestamp_us=\"%" PRIu64 "\"} %" PRIu64 "\n",
+                       labels, i, event.sequence, event.startTimestampUsecs,
+                       event.stopTimestampUsecs, event.execTimeUsecs);
+    if (written < 0 || (size_t)written >= sizeof(buffer)) return inspectorMemoryError;
+    if (fwrite(buffer, 1, written, file) != (size_t)written) return inspectorFileOpenError;
   }
 
   fflush(file);
@@ -497,22 +625,46 @@ static inspectorResult_t inspectorPromWriteP2pBucket(FILE* file,
                                     sizeof(labels),
                                     device.nodeName.c_str(),
                                     device.gpuName.c_str(),
+                                    key.commId.c_str(),
                                     key.commName.c_str(),
                                     version,
+                                    key.rank,
+                                    key.peer,
                                     key.nranks,
                                     key.nnodes,
                                     key.func,
-                                    key.msgSizeRangeBytes));
+                                    key.msgSizeRangeBytes,
+                                    key.msgSizeBytes,
+                                    key.timingSource.c_str()));
 
   double execMean = agg.count ? (agg.execTimeSum / agg.count) : 0.0;
   double busMean = agg.busCount ? std::exp(agg.busLogSum / agg.busCount) : 0.0;
 
-  char buffer[2048];
+  uint64_t p50 = inspectorPromPercentile(agg.execTimes, 0.50);
+  uint64_t p95 = inspectorPromPercentile(agg.execTimes, 0.95);
+  uint64_t p99 = inspectorPromPercentile(agg.execTimes, 0.99);
+  uint64_t execMin = agg.count ? agg.execTimeMin : 0;
+
+  char buffer[8192];
   int written = snprintf(buffer, sizeof(buffer),
                          "nccl_p2p_bus_bandwidth_gbs{%s} %.6g\n"
-                         "nccl_p2p_exec_time_microseconds{%s} %.6g\n",
+                         "nccl_p2p_count{%s} %" PRIu64 "\n"
+                         "nccl_p2p_exec_time_sum_microseconds{%s} %.6g\n"
+                         "nccl_p2p_exec_time_microseconds{%s} %.6g\n"
+                         "nccl_p2p_exec_time_min_microseconds{%s} %" PRIu64 "\n"
+                         "nccl_p2p_exec_time_p50_microseconds{%s} %" PRIu64 "\n"
+                         "nccl_p2p_exec_time_p95_microseconds{%s} %" PRIu64 "\n"
+                         "nccl_p2p_exec_time_p99_microseconds{%s} %" PRIu64 "\n"
+                         "nccl_p2p_exec_time_max_microseconds{%s} %" PRIu64 "\n",
                          labels, busMean,
-                         labels, execMean);
+                         labels, agg.count,
+                         labels, agg.execTimeSum,
+                         labels, execMean,
+                         labels, execMin,
+                         labels, p50,
+                         labels, p95,
+                         labels, p99,
+                         labels, agg.execTimeMax);
 
   if (written < 0 || (size_t)written >= sizeof(buffer)) {
     return inspectorMemoryError;
@@ -520,6 +672,20 @@ static inspectorResult_t inspectorPromWriteP2pBucket(FILE* file,
 
   if (fwrite(buffer, 1, written, file) != (size_t)written) {
     return inspectorFileOpenError;
+  }
+
+  for (size_t i = 0; i < agg.slowest.size(); i++) {
+    const inspectorPromSlowEvent& event = agg.slowest[i];
+    written = snprintf(buffer, sizeof(buffer),
+                       "nccl_p2p_slow_event_exec_time_microseconds{%s,"
+                       "top_index=\"%zu\",sequence=\"%" PRIu64 "\",peer=\"%d\","
+                       "start_timestamp_us=\"%" PRIu64 "\","
+                       "stop_timestamp_us=\"%" PRIu64 "\"} %" PRIu64 "\n",
+                       labels, i, event.sequence, event.peer,
+                       event.startTimestampUsecs, event.stopTimestampUsecs,
+                       event.execTimeUsecs);
+    if (written < 0 || (size_t)written >= sizeof(buffer)) return inspectorMemoryError;
+    if (fwrite(buffer, 1, written, file) != (size_t)written) return inspectorFileOpenError;
   }
 
   fflush(file);
@@ -547,6 +713,7 @@ static inspectorResult_t inspectorPromWriteP2pBucket(FILE* file,
  */
 static inspectorResult_t inspectorPromCommInfoDumpColl(struct inspectorCommInfo* commInfo,
                                                        inspectorPromCollBucketMap& buckets,
+                                                       uint64_t* overwritten,
                                                        bool* needs_writing) {
   if (commInfo == nullptr) {
     return inspectorSuccess;
@@ -556,7 +723,9 @@ static inspectorResult_t inspectorPromCommInfoDumpColl(struct inspectorCommInfo*
   drainedColl.clear();
 
   inspectorLockWr(&commInfo->guard);
-  if (commInfo->dump_coll) {
+  if (overwritten) *overwritten += commInfo->completedCollRing.overwritten;
+  commInfo->completedCollRing.overwritten = 0;
+  if (commInfo->dump_coll || inspectorRingNonEmpty(&commInfo->completedCollRing)) {
     if (commInfo->completedCollRing.size > 0
         && drainedColl.capacity() < commInfo->completedCollRing.size) {
       drainedColl.reserve(commInfo->completedCollRing.size);
@@ -583,13 +752,14 @@ static inspectorResult_t inspectorPromCommInfoDumpColl(struct inspectorCommInfo*
         commInfo->nnodes,
         collInfo.func,
         msgSizeRangeBytes,
+        collInfo.msgSizeBytes,
+        commInfo->rank,
+        commInfo->commHashStr,
         commName,
-        algoProto
+        algoProto,
+        inspectorTimingSourceToString(collInfo.timingSource)
       };
-      inspectorPromAggUpdate(buckets[key],
-                             collInfo.algoBwGbs,
-                             collInfo.busBwGbs,
-                             collInfo.execTimeUsecs);
+      inspectorPromAggUpdate(buckets[key], collInfo);
     }
   }
 
@@ -598,6 +768,7 @@ static inspectorResult_t inspectorPromCommInfoDumpColl(struct inspectorCommInfo*
 
 static inspectorResult_t inspectorPromCommInfoDumpP2p(struct inspectorCommInfo* commInfo,
                                                       inspectorPromP2pBucketMap& buckets,
+                                                      uint64_t* overwritten,
                                                       bool* needs_writing) {
   if (commInfo == nullptr) {
     return inspectorSuccess;
@@ -607,7 +778,9 @@ static inspectorResult_t inspectorPromCommInfoDumpP2p(struct inspectorCommInfo* 
   drainedP2p.clear();
 
   inspectorLockWr(&commInfo->guard);
-  if (commInfo->dump_p2p) {
+  if (overwritten) *overwritten += commInfo->completedP2pRing.overwritten;
+  commInfo->completedP2pRing.overwritten = 0;
+  if (commInfo->dump_p2p || inspectorRingNonEmpty(&commInfo->completedP2pRing)) {
     if (commInfo->completedP2pRing.size > 0
         && drainedP2p.capacity() < commInfo->completedP2pRing.size) {
       drainedP2p.reserve(commInfo->completedP2pRing.size);
@@ -631,12 +804,14 @@ static inspectorResult_t inspectorPromCommInfoDumpP2p(struct inspectorCommInfo* 
         commInfo->nnodes,
         p2pInfo.func,
         msgSizeRangeBytes,
-        commName
+        p2pInfo.msgSizeBytes,
+        commInfo->rank,
+        p2pInfo.peer,
+        commInfo->commHashStr,
+        commName,
+        inspectorTimingSourceToString(p2pInfo.timingSource)
       };
-      inspectorPromAggUpdate(buckets[key],
-                             p2pInfo.algoBwGbs,
-                             p2pInfo.busBwGbs,
-                             p2pInfo.execTimeUsecs);
+      inspectorPromAggUpdate(buckets[key], p2pInfo);
     }
   }
 
@@ -646,11 +821,15 @@ static inspectorResult_t inspectorPromCommInfoDumpP2p(struct inspectorCommInfo* 
 static inspectorResult_t inspectorPromCommInfoDump(struct inspectorCommInfo* commInfo,
                                                    inspectorPromCollBucketMap& collBuckets,
                                                    inspectorPromP2pBucketMap& p2pBuckets,
+                                                   uint64_t* collOverwritten,
+                                                   uint64_t* p2pOverwritten,
                                                    bool* needs_writing) {
   *needs_writing = false;
 
-  INS_CHK(inspectorPromCommInfoDumpColl(commInfo, collBuckets, needs_writing));
-  INS_CHK(inspectorPromCommInfoDumpP2p(commInfo, p2pBuckets, needs_writing));
+  INS_CHK(inspectorPromCommInfoDumpColl(commInfo, collBuckets,
+                                        collOverwritten, needs_writing));
+  INS_CHK(inspectorPromCommInfoDumpP2p(commInfo, p2pBuckets,
+                                       p2pOverwritten, needs_writing));
 
   return inspectorSuccess;
 }
@@ -694,6 +873,8 @@ static inspectorResult_t inspectorPromFillDeviceBuckets(struct inspectorCommInfo
     INS_CHK(inspectorPromCommInfoDump(itr,
                                       device.collBuckets,
                                       device.p2pBuckets,
+                                      &device.collOverwritten,
+                                      &device.p2pOverwritten,
                                       &needs_writing));
 
     if (needs_writing) {
@@ -734,6 +915,21 @@ static inspectorResult_t inspectorPromWriteDeviceBuckets(std::map<std::string,
     if (!file) {
       continue;
     }
+    char completeness[512];
+    int completenessWritten = snprintf(
+      completeness, sizeof(completeness),
+      "nccl_inspector_collective_ring_overwritten{node=\"%s\",gpu=\"%s\"} %" PRIu64 "\n"
+      "nccl_inspector_p2p_ring_overwritten{node=\"%s\",gpu=\"%s\"} %" PRIu64 "\n",
+      device.nodeName.c_str(), device.gpuName.c_str(), device.collOverwritten,
+      device.nodeName.c_str(), device.gpuName.c_str(), device.p2pOverwritten);
+    if (completenessWritten < 0
+        || (size_t)completenessWritten >= sizeof(completeness)) {
+      return inspectorMemoryError;
+    }
+    if (fwrite(completeness, 1, completenessWritten, file)
+        != (size_t)completenessWritten) {
+      return inspectorFileOpenError;
+    }
     for (const auto& collEntry : device.collBuckets) {
       INS_CHK(inspectorPromWriteCollBucket(file,
                                            device,
@@ -772,18 +968,41 @@ static inspectorResult_t inspectorPromWriteDeviceBuckets(std::map<std::string,
 inspectorResult_t inspectorPromCommInfoListDump(struct inspectorCommInfoList* commList,
                                                 const char* output_root,
                                                 struct inspectorDumpThread* dumpThread) {
-  INS_CHK(inspectorLockRd(&commList->guard));
+  return inspectorPromCommInfoListsDump(commList, nullptr, output_root, dumpThread);
+}
+
+inspectorResult_t inspectorPromCommInfoListsDump(struct inspectorCommInfoList* first,
+                                                 struct inspectorCommInfoList* second,
+                                                 const char* output_root,
+                                                 struct inspectorDumpThread* dumpThread) {
   inspectorResult_t res = inspectorSuccess;
+  uint32_t processed = 0;
+  uint32_t totalComms = 0;
+  uint64_t currentTime = inspectorGetTime();
+  std::map<std::string, inspectorPromDevice> devices;
 
-  if (commList->ncomms > 0) {
-    uint32_t processed = 0;
-    uint64_t currentTime = inspectorGetTime();
-    std::map<std::string, inspectorPromDevice> devices;
+  struct inspectorCommInfoList* lists[] = {first, second};
+  for (size_t i = 0; i < 2; i++) {
+    struct inspectorCommInfoList* commList = lists[i];
+    if (commList == nullptr) continue;
+    INS_CHK_GOTO(inspectorLockRd(&commList->guard), res, exit);
+    if (commList->ncomms > 0) {
+      uint32_t listProcessed = 0;
+      totalComms += commList->ncomms;
+      inspectorResult_t fillResult
+        = inspectorPromFillDeviceBuckets(commList, devices, &listProcessed);
+      inspectorUnlockRWLock(&commList->guard);
+      if (fillResult != inspectorSuccess) {
+        res = fillResult;
+        goto exit;
+      }
+      processed += listProcessed;
+    } else {
+      INS_CHK_GOTO(inspectorUnlockRWLock(&commList->guard), res, exit);
+    }
+  }
 
-    INS_CHK_GOTO(inspectorPromFillDeviceBuckets(commList,
-                                                devices,
-                                                &processed),
-                 res, exit);
+  if (!devices.empty()) {
     INS_CHK_GOTO(inspectorPromWriteDeviceBuckets(devices,
                                                  output_root,
                                                  currentTime,
@@ -791,11 +1010,10 @@ inspectorResult_t inspectorPromCommInfoListDump(struct inspectorCommInfoList* co
                  res, exit);
     TRACE_INSPECTOR(
       "NCCL Inspector: Completed dump across devices, flushed %u/%u communicators",
-      processed, commList->ncomms);
+      processed, totalComms);
   }
 
 exit:
-  INS_CHK(inspectorUnlockRWLock(&commList->guard));
   return res;
 }
 

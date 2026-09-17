@@ -76,9 +76,15 @@ OBJS := $(SRCS:%.cc=$(OBJDIR)/%.o)
 TARGET := libnccl-profiler-inspector.so
 
 # Build rules
-.PHONY: all clean help check-cuda
+.PHONY: all clean help check-cuda test-ring
 
 all: check-cuda $(TARGET)
+
+test-ring:
+	$(CXX) $(CXXSTD) -Wall -Wextra $(INCLUDES) \
+		tests/inspector_ring_test.cc inspector_ring.cc -o inspector_ring_test
+	./inspector_ring_test
+	rm -f inspector_ring_test
 
 # Check that CUDA installation exists
 check-cuda:
@@ -146,6 +152,7 @@ help:
 	@echo "  all     - Build the inspector library (default)"
 	@echo "  clean   - Clean build artifacts"
 	@echo "  help    - Show this help"
+	@echo "  test-ring - Run the host-only completed-ring unit test"
 	@echo ""
 	@echo "Options:"
 	@echo "  DEBUG=1                      - Enable debug build"

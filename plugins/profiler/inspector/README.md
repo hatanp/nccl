@@ -86,6 +86,13 @@ export NCCL_INSPECTOR_DUMP_THREAD_INTERVAL_MICROSECONDS=500
   Enables verbose output including event trace information.
 - `NCCL_INSPECTOR_PROM_DUMP=<0|1>` (default: `0`)
   Enables Prometheus format for textfile node exporter output instead of custom JSON.
+- `NCCL_INSPECTOR_PROM_RETAIN=<0|1>` (default: `0`)
+  Retains Prometheus summary files after process teardown. The default removes
+  them after the node exporter workflow has consumed them. For a final-only,
+  low-I/O diagnostic summary, set `NCCL_INSPECTOR_PROM_DUMP=1`,
+  `NCCL_INSPECTOR_PROM_RETAIN=1`, and
+  `NCCL_INSPECTOR_DUMP_THREAD_ENABLE=0`. Completed operations remain in the
+  configured rings and are aggregated once during finalization.
 - `NCCL_INSPECTOR_DUMP_MIN_SIZE_BYTES=<bytes>` (default: `8192`)
   Minimum message size (bytes) to be tracked by inspector.
 - `NCCL_INSPECTOR_DUMP_COLL_RING_SIZE=<entries>` (default: `1024`)
@@ -163,14 +170,19 @@ Note: Prometheus mode enforces a minimum dump interval of 30 seconds (30,000,000
 **Exported Metrics:**
 - `nccl_bus_bandwidth_gbs` - NCCL bus bandwidth in GB/s (collectives)
 - `nccl_collective_exec_time_microseconds` - Execution time in microseconds (collectives)
+- `nccl_collective_count` and `nccl_collective_exec_time_sum_microseconds`
+- `nccl_collective_exec_time_{min,p50,p95,p99,max}_microseconds`
+- `nccl_collective_slow_event_exec_time_microseconds` - bounded top-four slow events with sequence and timestamps
 - `nccl_p2p_bus_bandwidth_gbs` - NCCL P2P bus bandwidth in GB/s
 - `nccl_p2p_exec_time_microseconds` - P2P execution time in microseconds
+- Matching P2P count, sum, percentile, maximum and bounded slow-event metrics
+- `nccl_inspector_{collective,p2p}_ring_overwritten` - completeness counters
 
 When P2P tracking is enabled (`NCCL_INSPECTOR_ENABLE_P2P=1`), Prometheus output includes P2P metrics with a `p2p_operation` label (e.g., `Send`, `Recv`).
 
 **Labels:**
-- Collectives: `version`, `slurm_job_id`, `node`, `gpu`, `comm_name`, `n_nodes`, `nranks`, `collective`, `message_size`, `algo_proto`
-- P2P: `version`, `slurm_job_id`, `node`, `gpu`, `comm_name`, `n_nodes`, `nranks`, `p2p_operation`, `message_size`
+- Collectives: `version`, `slurm_job_id`, `world_rank`, `local_rank`, `node`, `gpu`, `comm_id`, `comm_name`, `comm_rank`, `n_nodes`, `nranks`, `collective`, `message_size`, `message_size_bytes`, `algo_proto`, `timing_source`
+- P2P: the same identity labels plus `peer`, `p2p_operation`, `message_size`, `message_size_bytes`, and `timing_source`
 
 `message_size` is a bucketed range string (for example `4-5GB`).
 
@@ -304,6 +316,8 @@ The size of output files depends on the output format and usage patterns:
 - File size is proportional to:
   - Number of parallel/overlapping communicators using the same GPU device
 - Each file contains only the most recent metrics snapshot
+- With `NCCL_INSPECTOR_PROM_RETAIN=1` and the dump thread disabled, each file
+  contains one final diagnostic summary and remains after process teardown.
 - Estimate: ~500-1000 bytes per communicator per metric
 - Example: 8 communicators on one GPU with 3 metrics ≈ 12-24 KB per GPU (fixed size)
 
@@ -311,4 +325,3 @@ The size of output files depends on the output format and usage patterns:
 
 - The plugin is compatible with standard NCCL workflows and can be used in both single-node and multi-node (SLURM) environments.
 - For more details, see the source code and comments in `plugins/profiler/inspector/`.
-

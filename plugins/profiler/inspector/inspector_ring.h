@@ -26,6 +26,7 @@ struct inspectorCompletedRing {
   uint32_t size{0};     // user-visible capacity (size+1 slots are allocated)
   uint32_t head{0};     // index of oldest element
   uint32_t tail{0};     // index where next element will be written
+  uint64_t overwritten{0}; // entries discarded because the ring was full
 };
 
 /*

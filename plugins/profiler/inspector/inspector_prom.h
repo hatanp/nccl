@@ -19,6 +19,10 @@ struct inspectorDumpThread;
 inspectorResult_t inspectorPromCommInfoListDump(struct inspectorCommInfoList* commList,
                                                 const char* output_root,
                                                 struct inspectorDumpThread* dumpThread);
+inspectorResult_t inspectorPromCommInfoListsDump(struct inspectorCommInfoList* first,
+                                                 struct inspectorCommInfoList* second,
+                                                 const char* output_root,
+                                                 struct inspectorDumpThread* dumpThread);
 
 // Prometheus-specific configuration
 int64_t inspectorPromValidateInterval(int64_t interval);
