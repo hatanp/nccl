@@ -744,8 +744,8 @@ static inspectorResult_t inspectorPromCommInfoDumpColl(struct inspectorCommInfo*
         = inspectorPromMessageSizeRangeLowerBound(collInfo.msgSizeBytes);
       const char* commName
         = (commInfo->commName && commInfo->commName[0]) ? commInfo->commName : "unknown";
-      const char* algo = (collInfo.algo && collInfo.algo[0]) ? collInfo.algo : "unknown";
-      const char* proto = (collInfo.proto && collInfo.proto[0]) ? collInfo.proto : "unknown";
+      const char* algo = collInfo.algo[0] ? collInfo.algo : "unknown";
+      const char* proto = collInfo.proto[0] ? collInfo.proto : "unknown";
       std::string algoProto = std::string(algo) + "_" + proto;
       inspectorPromCollBucketKey key {
         commInfo->nranks,

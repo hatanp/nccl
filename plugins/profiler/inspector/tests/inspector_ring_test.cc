@@ -2,7 +2,13 @@
 
 #include <assert.h>
 #include <stdint.h>
+#include <type_traits>
 #include <vector>
+
+static_assert(std::is_array<decltype(inspectorCompletedOpInfo::algo)>::value,
+              "completed collective records must own the algorithm name");
+static_assert(std::is_array<decltype(inspectorCompletedOpInfo::proto)>::value,
+              "completed collective records must own the protocol name");
 
 int main() {
   inspectorCompletedRing ring;

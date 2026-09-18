@@ -19,6 +19,8 @@
 #include "version.h"
 
 #define MAX_CHANNELS                     64
+#define NCCL_INSPECTOR_ALGO_NAME_MAX     32
+#define NCCL_INSPECTOR_PROTO_NAME_MAX    32
 
 // Bump when ncclProfiler_t alias changes to a new interface version.
 #define NCCL_PROFILER_INTERFACE_VERSION 5
@@ -150,8 +152,8 @@ struct inspectorCompletedOpInfo {
   inspectorTimingSource_t timingSource;
   double algoBwGbs;
   double busBwGbs;
-  const char* algo;   // coll only (nullptr for P2P)
-  const char* proto;  // coll only (nullptr for P2P)
+  char algo[NCCL_INSPECTOR_ALGO_NAME_MAX];   // coll only
+  char proto[NCCL_INSPECTOR_PROTO_NAME_MAX]; // coll only
   int peer;           // P2P only (unused for coll)
   struct inspectorEventTrkOpInfo evtTrk;
 };

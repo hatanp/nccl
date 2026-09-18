@@ -1635,8 +1635,10 @@ void inspectorUpdateCollPerf(struct inspectorCompletedOpInfo *completedOp,
   completedOp->msgSizeBytes = collInfo->msgSizeBytes;
   completedOp->execTimeUsecs =
     calculateMaxKernelExecTimeUsecs(collInfo, &completedOp->timingSource);
-  completedOp->algo = collInfo->algo;
-  completedOp->proto = collInfo->proto;
+  snprintf(completedOp->algo, sizeof(completedOp->algo), "%s",
+           collInfo->algo ? collInfo->algo : "unknown");
+  snprintf(completedOp->proto, sizeof(completedOp->proto), "%s",
+           collInfo->proto ? collInfo->proto : "unknown");
   completedOp->evtTrk = collInfo->collEvtTrk;
 }
 
