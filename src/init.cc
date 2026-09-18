@@ -368,6 +368,11 @@ static ncclResult_t commFree(ncclComm_t comm) {
 
   if (comm->nvlsSupport) NCCLCHECK(ncclNvlsFree(comm));
 
+  // The profiler thread polls communicator-owned host buffers registered in
+  // the destructor list below. Stop and join it before releasing those
+  // buffers, the permanent memory stack, or abortFlag.
+  NCCLCHECK(ncclProfilerThreadDestroy(comm));
+
   struct ncclDestructor* dtor = comm->destructorHead;
   while (dtor != nullptr) {
     NCCLCHECK(dtor->fn(dtor));
@@ -399,7 +404,6 @@ static ncclResult_t commFree(ncclComm_t comm) {
        comm->rank, comm->nRanks, comm->cudaDev, comm->busId, comm->commHash, abort ? "Abort" : "Destroy");
 
   commPoison(comm); // poison comm before free to avoid comm reuse.
-  NCCLCHECK(ncclProfilerThreadDestroy(comm));
   NCCLCHECK(ncclProfilerPluginFinalize(comm));
   if (sharedResRefCount == 0) {
     NCCLCHECK(ncclNetFinalize(comm));
