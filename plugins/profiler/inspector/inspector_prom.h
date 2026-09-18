@@ -15,6 +15,10 @@
 struct inspectorCommInfoList;
 struct inspectorDumpThread;
 
+bool inspectorPromStreamingEnabled();
+inspectorResult_t inspectorPromRecordCompleted(struct inspectorCommInfo* commInfo,
+                                               const struct inspectorCompletedOpInfo* op);
+
 // Prometheus-related function declarations
 inspectorResult_t inspectorPromCommInfoListDump(struct inspectorCommInfoList* commList,
                                                 const char* output_root,

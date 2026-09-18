@@ -8,6 +8,7 @@
 #include "inspector_prom.h"
 #include "inspector.h"
 #include "inspector_cudawrap.h"
+#include "inspector_prom_stats.h"
 #include "inspector_ring.h"
 
 #include <stdio.h>
@@ -17,6 +18,7 @@
 #include <algorithm>
 #include <map>
 #include <limits>
+#include <mutex>
 #include <string>
 #include <vector>
 #include <cmath>
@@ -52,6 +54,11 @@ struct inspectorPromBucketAgg {
   uint64_t algoCount = 0;
   double busLogSum = 0.0;
   uint64_t busCount = 0;
+};
+
+struct inspectorPromGlobalSlowEvent {
+  std::string labels;
+  inspectorPromSlowEvent event;
 };
 
 struct inspectorPromCollBucketKey {
@@ -120,11 +127,17 @@ struct inspectorPromDevice {
   FILE* file = nullptr;
   inspectorPromCollBucketMap collBuckets;
   inspectorPromP2pBucketMap p2pBuckets;
+  std::vector<inspectorPromGlobalSlowEvent> collSlowest;
+  std::vector<inspectorPromGlobalSlowEvent> p2pSlowest;
   uint64_t collOverwritten = 0;
   uint64_t p2pOverwritten = 0;
   bool hasData = false;
 };
-static const int kInspectorPromFormatMinor = 2;
+static const int kInspectorPromFormatMinor = 3;
+static const size_t kInspectorPromPercentileSampleCapacity = 256;
+static const size_t kInspectorPromGlobalSlowEventCapacity = 4;
+static std::mutex gInspectorPromStreamingMutex;
+static std::map<std::string, inspectorPromDevice> gInspectorPromStreamingDevices;
 
 static void inspectorPromAggUpdate(inspectorPromBucketAgg& agg,
                                    const inspectorCompletedOpInfo& op) {
@@ -132,20 +145,27 @@ static void inspectorPromAggUpdate(inspectorPromBucketAgg& agg,
   agg.execTimeSum += static_cast<double>(op.execTimeUsecs);
   agg.execTimeMin = std::min(agg.execTimeMin, op.execTimeUsecs);
   agg.execTimeMax = std::max(agg.execTimeMax, op.execTimeUsecs);
-  agg.execTimes.push_back(op.execTimeUsecs);
-
-  inspectorPromSlowEvent event;
-  event.sequence = op.sn;
-  event.execTimeUsecs = op.execTimeUsecs;
-  event.startTimestampUsecs = op.evtTrk.evntTrace[NCCL_INSP_EVT_TRK_OP_START].ts;
-  event.stopTimestampUsecs = op.evtTrk.evntTrace[NCCL_INSP_EVT_TRK_OP_STOP].ts;
-  event.peer = op.peer;
-  agg.slowest.push_back(event);
-  std::sort(agg.slowest.begin(), agg.slowest.end(),
-            [](const inspectorPromSlowEvent& lhs, const inspectorPromSlowEvent& rhs) {
-              return lhs.execTimeUsecs > rhs.execTimeUsecs;
-            });
-  if (agg.slowest.size() > 4) agg.slowest.resize(4);
+  if (inspectorPromStreamingEnabled()) {
+    inspectorPromBoundedSampleUpdate(agg.execTimes,
+                                     kInspectorPromPercentileSampleCapacity,
+                                     agg.count, op.sn, op.msgSizeBytes,
+                                     op.execTimeUsecs);
+  } else {
+    agg.execTimes.push_back(op.execTimeUsecs);
+    inspectorPromSlowEvent event;
+    event.sequence = op.sn;
+    event.execTimeUsecs = op.execTimeUsecs;
+    event.startTimestampUsecs
+      = op.evtTrk.evntTrace[NCCL_INSP_EVT_TRK_OP_START].ts;
+    event.stopTimestampUsecs
+      = op.evtTrk.evntTrace[NCCL_INSP_EVT_TRK_OP_STOP].ts;
+    event.peer = op.peer;
+    inspectorPromBoundedTopK(
+      agg.slowest, std::move(event), kInspectorPromGlobalSlowEventCapacity,
+      [](const inspectorPromSlowEvent& lhs, const inspectorPromSlowEvent& rhs) {
+        return lhs.execTimeUsecs > rhs.execTimeUsecs;
+      });
+  }
 
   if (op.algoBwGbs > 0.0) {
     // Geometric mean trick: sum log(x), then exp(sum/count) later.
@@ -308,6 +328,22 @@ static inspectorResult_t inspectorPromGetLabelsColl(char* labels,
                                       msgSizeStr,
                                       sizeof(msgSizeStr));
 
+  if (inspectorPromStreamingEnabled()) {
+    int compactRet = snprintf(
+      labels, labelSize,
+      "version=\"%s\",comm_id=\"%s\",comm_name=\"%s\",comm_rank=\"%d\","
+      "n_nodes=\"%d\",nranks=\"%d\",collective=\"%s\","
+      "message_size_bytes=\"%zu\",algo_proto=\"%s\",timing_source=\"%s\"",
+      (version && version[0]) ? version : "unknown",
+      (commId && commId[0]) ? commId : "unknown",
+      (commName && commName[0]) ? commName : "unknown",
+      rank, nnodes, nranks, ncclFuncToString(func), msgSizeBytes,
+      algoProto ? algoProto : "unknown",
+      timingSource ? timingSource : "unknown");
+    return (compactRet < 0 || (size_t)compactRet >= labelSize)
+      ? inspectorMemoryError : inspectorSuccess;
+  }
+
   int ret = snprintf(labels, labelSize,
                      "version=\"%s\",slurm_job_id=\"%s\",world_rank=\"%s\","
                      "local_rank=\"%s\",node=\"%s\",gpu=\"%s\","
@@ -384,6 +420,21 @@ static inspectorResult_t inspectorPromGetLabelsP2p(char* labels,
                                       msgSizeStr,
                                       sizeof(msgSizeStr));
 
+  if (inspectorPromStreamingEnabled()) {
+    int compactRet = snprintf(
+      labels, labelSize,
+      "version=\"%s\",comm_id=\"%s\",comm_name=\"%s\",comm_rank=\"%d\","
+      "peer=\"%d\",n_nodes=\"%d\",nranks=\"%d\",p2p_operation=\"%s\","
+      "message_size_bytes=\"%zu\",timing_source=\"%s\"",
+      (version && version[0]) ? version : "unknown",
+      (commId && commId[0]) ? commId : "unknown",
+      (commName && commName[0]) ? commName : "unknown",
+      rank, peer, nnodes, nranks, ncclFuncToString(func), msgSizeBytes,
+      timingSource ? timingSource : "unknown");
+    return (compactRet < 0 || (size_t)compactRet >= labelSize)
+      ? inspectorMemoryError : inspectorSuccess;
+  }
+
   int ret = snprintf(labels,
                      labelSize,
                      "version=\"%s\",slurm_job_id=\"%s\",world_rank=\"%s\","
@@ -426,6 +477,119 @@ static void inspectorPromGetNodeName(char* nodeName, size_t nodeNameSize) {
   nodeName[nodeNameSize - 1] = '\0';
 }
 
+static void inspectorPromInitDevice(inspectorPromDevice& device,
+                                    const inspectorCommInfo* commInfo) {
+  if (device.deviceUuidStr.empty()) {
+    device.deviceUuidStr = commInfo->deviceUuidStr;
+  }
+  if (device.nodeName.empty()) {
+    char nodeName[256];
+    inspectorPromGetNodeName(nodeName, sizeof(nodeName));
+    device.nodeName = nodeName;
+  }
+  if (device.gpuName.empty()) {
+    char gpuName[16];
+    snprintf(gpuName, sizeof(gpuName), "GPU%d", commInfo->cudaDeviceId);
+    device.gpuName = gpuName;
+  }
+}
+
+static void inspectorPromAddGlobalSlowEvent(
+    std::vector<inspectorPromGlobalSlowEvent>& slowest,
+    const char* labels,
+    const inspectorCompletedOpInfo& op) {
+  inspectorPromGlobalSlowEvent item;
+  item.labels = labels;
+  item.event.sequence = op.sn;
+  item.event.execTimeUsecs = op.execTimeUsecs;
+  item.event.startTimestampUsecs
+    = op.evtTrk.evntTrace[NCCL_INSP_EVT_TRK_OP_START].ts;
+  item.event.stopTimestampUsecs
+    = op.evtTrk.evntTrace[NCCL_INSP_EVT_TRK_OP_STOP].ts;
+  item.event.peer = op.peer;
+  inspectorPromBoundedTopK(
+    slowest, std::move(item), kInspectorPromGlobalSlowEventCapacity,
+    [](const inspectorPromGlobalSlowEvent& lhs,
+       const inspectorPromGlobalSlowEvent& rhs) {
+      return lhs.event.execTimeUsecs > rhs.event.execTimeUsecs;
+    });
+}
+
+inspectorResult_t inspectorPromRecordCompleted(inspectorCommInfo* commInfo,
+                                               const inspectorCompletedOpInfo* op) {
+  if (commInfo == nullptr || op == nullptr) return inspectorMemoryError;
+
+  std::lock_guard<std::mutex> lock(gInspectorPromStreamingMutex);
+  inspectorPromDevice& device
+    = gInspectorPromStreamingDevices[commInfo->deviceUuidStr];
+  inspectorPromInitDevice(device, commInfo);
+  const char* commName
+    = (commInfo->commName && commInfo->commName[0]) ? commInfo->commName : "unknown";
+  size_t msgSizeRangeBytes
+    = inspectorPromMessageSizeRangeLowerBound(op->msgSizeBytes);
+  char labels[1024];
+  char version[16];
+  inspectorPromGetVersion(version, sizeof(version));
+
+  if (op->isP2p) {
+    inspectorPromP2pBucketKey key {
+      commInfo->nranks,
+      commInfo->nnodes,
+      op->func,
+      msgSizeRangeBytes,
+      op->msgSizeBytes,
+      commInfo->rank,
+      op->peer,
+      commInfo->commHashStr,
+      commName,
+      inspectorTimingSourceToString(op->timingSource)
+    };
+    inspectorPromAggUpdate(device.p2pBuckets[key], *op);
+    INS_CHK(inspectorPromGetLabelsP2p(labels, sizeof(labels),
+                                      device.nodeName.c_str(),
+                                      device.gpuName.c_str(),
+                                      key.commId.c_str(), key.commName.c_str(),
+                                      version, key.rank, key.peer, key.nranks,
+                                      key.nnodes, key.func, key.msgSizeRangeBytes,
+                                      key.msgSizeBytes, key.timingSource.c_str()));
+    inspectorPromAddGlobalSlowEvent(device.p2pSlowest, labels, *op);
+  } else {
+    const char* algo = op->algo[0] ? op->algo : "unknown";
+    const char* proto = op->proto[0] ? op->proto : "unknown";
+    inspectorPromCollBucketKey key {
+      commInfo->nranks,
+      commInfo->nnodes,
+      op->func,
+      msgSizeRangeBytes,
+      op->msgSizeBytes,
+      commInfo->rank,
+      commInfo->commHashStr,
+      commName,
+      std::string(algo) + "_" + proto,
+      inspectorTimingSourceToString(op->timingSource)
+    };
+    inspectorPromAggUpdate(device.collBuckets[key], *op);
+    INS_CHK(inspectorPromGetLabelsColl(labels, sizeof(labels),
+                                       device.nodeName.c_str(),
+                                       device.gpuName.c_str(),
+                                       key.commId.c_str(), key.commName.c_str(),
+                                       version, key.rank, key.nranks, key.nnodes,
+                                       key.func, key.algoProto.c_str(),
+                                       key.msgSizeRangeBytes, key.msgSizeBytes,
+                                       key.timingSource.c_str()));
+    inspectorPromAddGlobalSlowEvent(device.collSlowest, labels, *op);
+  }
+
+  device.hasData = true;
+  return inspectorSuccess;
+}
+
+static void inspectorPromTakeStreamingDevices(
+    std::map<std::string, inspectorPromDevice>& devices) {
+  std::lock_guard<std::mutex> lock(gInspectorPromStreamingMutex);
+  devices.swap(gInspectorPromStreamingDevices);
+}
+
 /*
  * Description:
  *
@@ -454,9 +618,17 @@ static inspectorResult_t inspectorPromGetFilename(const char* baseFilename,
                                                   const char* deviceUuidStr,
                                                   char* output,
                                                   size_t outputSize) {
-  snprintf(output, outputSize,
-           "%s/nccl_inspector_metrics_%s.prom",
-           baseFilename, deviceUuidStr);
+  const char* jobId = getenv("SLURM_JOB_ID");
+  if (inspectorPromStreamingEnabled()) {
+    snprintf(output, outputSize,
+             "%s/nccl_inspector_metrics_job%s_%s.prom",
+             baseFilename, (jobId && jobId[0]) ? jobId : "unknown",
+             deviceUuidStr);
+  } else {
+    snprintf(output, outputSize,
+             "%s/nccl_inspector_metrics_%s.prom",
+             baseFilename, deviceUuidStr);
+  }
 
   return inspectorSuccess;
 }
@@ -554,25 +726,46 @@ static inspectorResult_t inspectorPromWriteCollBucket(FILE* file,
   uint64_t execMin = agg.count ? agg.execTimeMin : 0;
 
   char buffer[8192];
-  int written = snprintf(buffer, sizeof(buffer),
-                         "nccl_bus_bandwidth_gbs{%s} %.6g\n"
-                         "nccl_collective_count{%s} %" PRIu64 "\n"
-                         "nccl_collective_exec_time_sum_microseconds{%s} %.6g\n"
-                         "nccl_collective_exec_time_microseconds{%s} %.6g\n"
-                         "nccl_collective_exec_time_min_microseconds{%s} %" PRIu64 "\n"
-                         "nccl_collective_exec_time_p50_microseconds{%s} %" PRIu64 "\n"
-                         "nccl_collective_exec_time_p95_microseconds{%s} %" PRIu64 "\n"
-                         "nccl_collective_exec_time_p99_microseconds{%s} %" PRIu64 "\n"
-                         "nccl_collective_exec_time_max_microseconds{%s} %" PRIu64 "\n",
-                         labels, busMean,
-                         labels, agg.count,
-                         labels, agg.execTimeSum,
-                         labels, execMean,
-                         labels, execMin,
-                         labels, p50,
-                         labels, p95,
-                         labels, p99,
-                         labels, agg.execTimeMax);
+  int written;
+  if (inspectorPromStreamingEnabled()) {
+    written = snprintf(buffer, sizeof(buffer),
+                       "nccl_bus_bandwidth_gbs{%s} %.6g\n"
+                       "nccl_collective_count{%s,percentile_samples=\"%zu\"} %" PRIu64 "\n"
+                       "nccl_collective_exec_time_sum_microseconds{%s} %.6g\n"
+                       "nccl_collective_exec_time_min_microseconds{%s} %" PRIu64 "\n"
+                       "nccl_collective_exec_time_p50_microseconds{%s} %" PRIu64 "\n"
+                       "nccl_collective_exec_time_p95_microseconds{%s} %" PRIu64 "\n"
+                       "nccl_collective_exec_time_p99_microseconds{%s} %" PRIu64 "\n"
+                       "nccl_collective_exec_time_max_microseconds{%s} %" PRIu64 "\n",
+                       labels, busMean,
+                       labels, agg.execTimes.size(), agg.count,
+                       labels, agg.execTimeSum,
+                       labels, execMin,
+                       labels, p50,
+                       labels, p95,
+                       labels, p99,
+                       labels, agg.execTimeMax);
+  } else {
+    written = snprintf(buffer, sizeof(buffer),
+                       "nccl_bus_bandwidth_gbs{%s} %.6g\n"
+                       "nccl_collective_count{%s} %" PRIu64 "\n"
+                       "nccl_collective_exec_time_sum_microseconds{%s} %.6g\n"
+                       "nccl_collective_exec_time_microseconds{%s} %.6g\n"
+                       "nccl_collective_exec_time_min_microseconds{%s} %" PRIu64 "\n"
+                       "nccl_collective_exec_time_p50_microseconds{%s} %" PRIu64 "\n"
+                       "nccl_collective_exec_time_p95_microseconds{%s} %" PRIu64 "\n"
+                       "nccl_collective_exec_time_p99_microseconds{%s} %" PRIu64 "\n"
+                       "nccl_collective_exec_time_max_microseconds{%s} %" PRIu64 "\n",
+                       labels, busMean,
+                       labels, agg.count,
+                       labels, agg.execTimeSum,
+                       labels, execMean,
+                       labels, execMin,
+                       labels, p50,
+                       labels, p95,
+                       labels, p99,
+                       labels, agg.execTimeMax);
+  }
 
   if (written < 0 || (size_t)written >= sizeof(buffer)) {
     return inspectorMemoryError;
@@ -582,17 +775,23 @@ static inspectorResult_t inspectorPromWriteCollBucket(FILE* file,
     return inspectorFileOpenError;
   }
 
-  for (size_t i = 0; i < agg.slowest.size(); i++) {
-    const inspectorPromSlowEvent& event = agg.slowest[i];
-    written = snprintf(buffer, sizeof(buffer),
-                       "nccl_collective_slow_event_exec_time_microseconds{%s,"
-                       "top_index=\"%zu\",sequence=\"%" PRIu64 "\","
-                       "start_timestamp_us=\"%" PRIu64 "\","
-                       "stop_timestamp_us=\"%" PRIu64 "\"} %" PRIu64 "\n",
-                       labels, i, event.sequence, event.startTimestampUsecs,
-                       event.stopTimestampUsecs, event.execTimeUsecs);
-    if (written < 0 || (size_t)written >= sizeof(buffer)) return inspectorMemoryError;
-    if (fwrite(buffer, 1, written, file) != (size_t)written) return inspectorFileOpenError;
+  if (!inspectorPromStreamingEnabled()) {
+    for (size_t i = 0; i < agg.slowest.size(); i++) {
+      const inspectorPromSlowEvent& event = agg.slowest[i];
+      written = snprintf(buffer, sizeof(buffer),
+                         "nccl_collective_slow_event_exec_time_microseconds{%s,"
+                         "top_index=\"%zu\",sequence=\"%" PRIu64 "\","
+                         "start_timestamp_us=\"%" PRIu64 "\","
+                         "stop_timestamp_us=\"%" PRIu64 "\"} %" PRIu64 "\n",
+                         labels, i, event.sequence, event.startTimestampUsecs,
+                         event.stopTimestampUsecs, event.execTimeUsecs);
+      if (written < 0 || (size_t)written >= sizeof(buffer)) {
+        return inspectorMemoryError;
+      }
+      if (fwrite(buffer, 1, written, file) != (size_t)written) {
+        return inspectorFileOpenError;
+      }
+    }
   }
 
   fflush(file);
@@ -646,25 +845,46 @@ static inspectorResult_t inspectorPromWriteP2pBucket(FILE* file,
   uint64_t execMin = agg.count ? agg.execTimeMin : 0;
 
   char buffer[8192];
-  int written = snprintf(buffer, sizeof(buffer),
-                         "nccl_p2p_bus_bandwidth_gbs{%s} %.6g\n"
-                         "nccl_p2p_count{%s} %" PRIu64 "\n"
-                         "nccl_p2p_exec_time_sum_microseconds{%s} %.6g\n"
-                         "nccl_p2p_exec_time_microseconds{%s} %.6g\n"
-                         "nccl_p2p_exec_time_min_microseconds{%s} %" PRIu64 "\n"
-                         "nccl_p2p_exec_time_p50_microseconds{%s} %" PRIu64 "\n"
-                         "nccl_p2p_exec_time_p95_microseconds{%s} %" PRIu64 "\n"
-                         "nccl_p2p_exec_time_p99_microseconds{%s} %" PRIu64 "\n"
-                         "nccl_p2p_exec_time_max_microseconds{%s} %" PRIu64 "\n",
-                         labels, busMean,
-                         labels, agg.count,
-                         labels, agg.execTimeSum,
-                         labels, execMean,
-                         labels, execMin,
-                         labels, p50,
-                         labels, p95,
-                         labels, p99,
-                         labels, agg.execTimeMax);
+  int written;
+  if (inspectorPromStreamingEnabled()) {
+    written = snprintf(buffer, sizeof(buffer),
+                       "nccl_p2p_bus_bandwidth_gbs{%s} %.6g\n"
+                       "nccl_p2p_count{%s,percentile_samples=\"%zu\"} %" PRIu64 "\n"
+                       "nccl_p2p_exec_time_sum_microseconds{%s} %.6g\n"
+                       "nccl_p2p_exec_time_min_microseconds{%s} %" PRIu64 "\n"
+                       "nccl_p2p_exec_time_p50_microseconds{%s} %" PRIu64 "\n"
+                       "nccl_p2p_exec_time_p95_microseconds{%s} %" PRIu64 "\n"
+                       "nccl_p2p_exec_time_p99_microseconds{%s} %" PRIu64 "\n"
+                       "nccl_p2p_exec_time_max_microseconds{%s} %" PRIu64 "\n",
+                       labels, busMean,
+                       labels, agg.execTimes.size(), agg.count,
+                       labels, agg.execTimeSum,
+                       labels, execMin,
+                       labels, p50,
+                       labels, p95,
+                       labels, p99,
+                       labels, agg.execTimeMax);
+  } else {
+    written = snprintf(buffer, sizeof(buffer),
+                       "nccl_p2p_bus_bandwidth_gbs{%s} %.6g\n"
+                       "nccl_p2p_count{%s} %" PRIu64 "\n"
+                       "nccl_p2p_exec_time_sum_microseconds{%s} %.6g\n"
+                       "nccl_p2p_exec_time_microseconds{%s} %.6g\n"
+                       "nccl_p2p_exec_time_min_microseconds{%s} %" PRIu64 "\n"
+                       "nccl_p2p_exec_time_p50_microseconds{%s} %" PRIu64 "\n"
+                       "nccl_p2p_exec_time_p95_microseconds{%s} %" PRIu64 "\n"
+                       "nccl_p2p_exec_time_p99_microseconds{%s} %" PRIu64 "\n"
+                       "nccl_p2p_exec_time_max_microseconds{%s} %" PRIu64 "\n",
+                       labels, busMean,
+                       labels, agg.count,
+                       labels, agg.execTimeSum,
+                       labels, execMean,
+                       labels, execMin,
+                       labels, p50,
+                       labels, p95,
+                       labels, p99,
+                       labels, agg.execTimeMax);
+  }
 
   if (written < 0 || (size_t)written >= sizeof(buffer)) {
     return inspectorMemoryError;
@@ -674,21 +894,54 @@ static inspectorResult_t inspectorPromWriteP2pBucket(FILE* file,
     return inspectorFileOpenError;
   }
 
-  for (size_t i = 0; i < agg.slowest.size(); i++) {
-    const inspectorPromSlowEvent& event = agg.slowest[i];
-    written = snprintf(buffer, sizeof(buffer),
-                       "nccl_p2p_slow_event_exec_time_microseconds{%s,"
-                       "top_index=\"%zu\",sequence=\"%" PRIu64 "\",peer=\"%d\","
-                       "start_timestamp_us=\"%" PRIu64 "\","
-                       "stop_timestamp_us=\"%" PRIu64 "\"} %" PRIu64 "\n",
-                       labels, i, event.sequence, event.peer,
-                       event.startTimestampUsecs, event.stopTimestampUsecs,
-                       event.execTimeUsecs);
-    if (written < 0 || (size_t)written >= sizeof(buffer)) return inspectorMemoryError;
-    if (fwrite(buffer, 1, written, file) != (size_t)written) return inspectorFileOpenError;
+  if (!inspectorPromStreamingEnabled()) {
+    for (size_t i = 0; i < agg.slowest.size(); i++) {
+      const inspectorPromSlowEvent& event = agg.slowest[i];
+      written = snprintf(buffer, sizeof(buffer),
+                         "nccl_p2p_slow_event_exec_time_microseconds{%s,"
+                         "top_index=\"%zu\",sequence=\"%" PRIu64 "\",peer=\"%d\","
+                         "start_timestamp_us=\"%" PRIu64 "\","
+                         "stop_timestamp_us=\"%" PRIu64 "\"} %" PRIu64 "\n",
+                         labels, i, event.sequence, event.peer,
+                         event.startTimestampUsecs, event.stopTimestampUsecs,
+                         event.execTimeUsecs);
+      if (written < 0 || (size_t)written >= sizeof(buffer)) {
+        return inspectorMemoryError;
+      }
+      if (fwrite(buffer, 1, written, file) != (size_t)written) {
+        return inspectorFileOpenError;
+      }
+    }
   }
 
   fflush(file);
+  return inspectorSuccess;
+}
+
+static inspectorResult_t inspectorPromWriteGlobalSlowEvents(
+    FILE* file,
+    const char* metric,
+    const std::vector<inspectorPromGlobalSlowEvent>& slowest) {
+  if (!file) return inspectorFileOpenError;
+
+  char buffer[8192];
+  for (size_t i = 0; i < slowest.size(); i++) {
+    const inspectorPromGlobalSlowEvent& item = slowest[i];
+    int written = snprintf(
+      buffer, sizeof(buffer),
+      "%s{%s,top_index=\"%zu\",sequence=\"%" PRIu64 "\","
+      "start_timestamp_us=\"%" PRIu64 "\",stop_timestamp_us=\"%" PRIu64
+      "\"} %" PRIu64 "\n",
+      metric, item.labels.c_str(), i, item.event.sequence,
+      item.event.startTimestampUsecs, item.event.stopTimestampUsecs,
+      item.event.execTimeUsecs);
+    if (written < 0 || (size_t)written >= sizeof(buffer)) {
+      return inspectorMemoryError;
+    }
+    if (fwrite(buffer, 1, written, file) != (size_t)written) {
+      return inspectorFileOpenError;
+    }
+  }
   return inspectorSuccess;
 }
 
@@ -712,7 +965,7 @@ static inspectorResult_t inspectorPromWriteP2pBucket(FILE* file,
  *   inspectorResult_t - success or error code.
  */
 static inspectorResult_t inspectorPromCommInfoDumpColl(struct inspectorCommInfo* commInfo,
-                                                       inspectorPromCollBucketMap& buckets,
+                                                       inspectorPromDevice& device,
                                                        uint64_t* overwritten,
                                                        bool* needs_writing) {
   if (commInfo == nullptr) {
@@ -759,7 +1012,21 @@ static inspectorResult_t inspectorPromCommInfoDumpColl(struct inspectorCommInfo*
         algoProto,
         inspectorTimingSourceToString(collInfo.timingSource)
       };
-      inspectorPromAggUpdate(buckets[key], collInfo);
+      inspectorPromAggUpdate(device.collBuckets[key], collInfo);
+      char labels[1024];
+      char version[16];
+      inspectorPromGetVersion(version, sizeof(version));
+      INS_CHK(inspectorPromGetLabelsColl(labels, sizeof(labels),
+                                         device.nodeName.c_str(),
+                                         device.gpuName.c_str(),
+                                         key.commId.c_str(), key.commName.c_str(),
+                                         version, key.rank, key.nranks, key.nnodes,
+                                         key.func, key.algoProto.c_str(),
+                                         key.msgSizeRangeBytes, key.msgSizeBytes,
+                                         key.timingSource.c_str()));
+      if (inspectorPromStreamingEnabled()) {
+        inspectorPromAddGlobalSlowEvent(device.collSlowest, labels, collInfo);
+      }
     }
   }
 
@@ -767,7 +1034,7 @@ static inspectorResult_t inspectorPromCommInfoDumpColl(struct inspectorCommInfo*
 }
 
 static inspectorResult_t inspectorPromCommInfoDumpP2p(struct inspectorCommInfo* commInfo,
-                                                      inspectorPromP2pBucketMap& buckets,
+                                                      inspectorPromDevice& device,
                                                       uint64_t* overwritten,
                                                       bool* needs_writing) {
   if (commInfo == nullptr) {
@@ -811,7 +1078,21 @@ static inspectorResult_t inspectorPromCommInfoDumpP2p(struct inspectorCommInfo* 
         commName,
         inspectorTimingSourceToString(p2pInfo.timingSource)
       };
-      inspectorPromAggUpdate(buckets[key], p2pInfo);
+      inspectorPromAggUpdate(device.p2pBuckets[key], p2pInfo);
+      char labels[1024];
+      char version[16];
+      inspectorPromGetVersion(version, sizeof(version));
+      INS_CHK(inspectorPromGetLabelsP2p(labels, sizeof(labels),
+                                        device.nodeName.c_str(),
+                                        device.gpuName.c_str(),
+                                        key.commId.c_str(), key.commName.c_str(),
+                                        version, key.rank, key.peer, key.nranks,
+                                        key.nnodes, key.func,
+                                        key.msgSizeRangeBytes, key.msgSizeBytes,
+                                        key.timingSource.c_str()));
+      if (inspectorPromStreamingEnabled()) {
+        inspectorPromAddGlobalSlowEvent(device.p2pSlowest, labels, p2pInfo);
+      }
     }
   }
 
@@ -819,16 +1100,15 @@ static inspectorResult_t inspectorPromCommInfoDumpP2p(struct inspectorCommInfo* 
 }
 
 static inspectorResult_t inspectorPromCommInfoDump(struct inspectorCommInfo* commInfo,
-                                                   inspectorPromCollBucketMap& collBuckets,
-                                                   inspectorPromP2pBucketMap& p2pBuckets,
+                                                   inspectorPromDevice& device,
                                                    uint64_t* collOverwritten,
                                                    uint64_t* p2pOverwritten,
                                                    bool* needs_writing) {
   *needs_writing = false;
 
-  INS_CHK(inspectorPromCommInfoDumpColl(commInfo, collBuckets,
+  INS_CHK(inspectorPromCommInfoDumpColl(commInfo, device,
                                         collOverwritten, needs_writing));
-  INS_CHK(inspectorPromCommInfoDumpP2p(commInfo, p2pBuckets,
+  INS_CHK(inspectorPromCommInfoDumpP2p(commInfo, device,
                                        p2pOverwritten, needs_writing));
 
   return inspectorSuccess;
@@ -856,23 +1136,10 @@ static inspectorResult_t inspectorPromFillDeviceBuckets(struct inspectorCommInfo
 
     std::string deviceKey(itr->deviceUuidStr);
     inspectorPromDevice& device = devices[deviceKey];
-    if (device.deviceUuidStr.empty()) {
-      device.deviceUuidStr = deviceKey;
-    }
-    if (device.nodeName.empty()) {
-      char nodeName[256];
-      inspectorPromGetNodeName(nodeName, sizeof(nodeName));
-      device.nodeName = nodeName;
-    }
-    if (device.gpuName.empty()) {
-      char gpuName[16];
-      snprintf(gpuName, sizeof(gpuName), "GPU%d", itr->cudaDeviceId);
-      device.gpuName = gpuName;
-    }
+    inspectorPromInitDevice(device, itr);
 
     INS_CHK(inspectorPromCommInfoDump(itr,
-                                      device.collBuckets,
-                                      device.p2pBuckets,
+                                      device,
                                       &device.collOverwritten,
                                       &device.p2pOverwritten,
                                       &needs_writing));
@@ -915,6 +1182,28 @@ static inspectorResult_t inspectorPromWriteDeviceBuckets(std::map<std::string,
     if (!file) {
       continue;
     }
+    if (inspectorPromStreamingEnabled()) {
+      const char* jobId = getenv("SLURM_JOB_ID");
+      const char* worldRank = getenv("SLURM_PROCID");
+      const char* localRank = getenv("SLURM_LOCALID");
+      char version[16];
+      inspectorPromGetVersion(version, sizeof(version));
+      char identity[1024];
+      int identityWritten = snprintf(
+        identity, sizeof(identity),
+        "nccl_inspector_identity{version=\"%s\",slurm_job_id=\"%s\","
+        "world_rank=\"%s\",local_rank=\"%s\",node=\"%s\",gpu=\"%s\"} 1\n",
+        version, jobId ? jobId : "unknown", worldRank ? worldRank : "unknown",
+        localRank ? localRank : "unknown", device.nodeName.c_str(),
+        device.gpuName.c_str());
+      if (identityWritten < 0 || (size_t)identityWritten >= sizeof(identity)) {
+        return inspectorMemoryError;
+      }
+      if (fwrite(identity, 1, identityWritten, file)
+          != (size_t)identityWritten) {
+        return inspectorFileOpenError;
+      }
+    }
     char completeness[512];
     int completenessWritten = snprintf(
       completeness, sizeof(completeness),
@@ -942,6 +1231,12 @@ static inspectorResult_t inspectorPromWriteDeviceBuckets(std::map<std::string,
                                           p2pEntry.first,
                                           p2pEntry.second));
     }
+    INS_CHK(inspectorPromWriteGlobalSlowEvents(
+      file, "nccl_collective_slow_event_exec_time_microseconds",
+      device.collSlowest));
+    INS_CHK(inspectorPromWriteGlobalSlowEvents(
+      file, "nccl_p2p_slow_event_exec_time_microseconds",
+      device.p2pSlowest));
   }
   return inspectorSuccess;
 }
@@ -980,6 +1275,7 @@ inspectorResult_t inspectorPromCommInfoListsDump(struct inspectorCommInfoList* f
   uint32_t totalComms = 0;
   uint64_t currentTime = inspectorGetTime();
   std::map<std::string, inspectorPromDevice> devices;
+  inspectorPromTakeStreamingDevices(devices);
 
   struct inspectorCommInfoList* lists[] = {first, second};
   for (size_t i = 0; i < 2; i++) {

@@ -91,8 +91,11 @@ export NCCL_INSPECTOR_DUMP_THREAD_INTERVAL_MICROSECONDS=500
   them after the node exporter workflow has consumed them. For a final-only,
   low-I/O diagnostic summary, set `NCCL_INSPECTOR_PROM_DUMP=1`,
   `NCCL_INSPECTOR_PROM_RETAIN=1`, and
-  `NCCL_INSPECTOR_DUMP_THREAD_ENABLE=0`. Completed operations remain in the
-  configured rings and are aggregated once during finalization.
+  `NCCL_INSPECTOR_DUMP_THREAD_ENABLE=0`. Completed operations update bounded
+  per-bucket aggregates online; finalization performs one file write. Each
+  bucket retains at most 256 deterministic reservoir samples for percentiles,
+  and each device retains four global collective and four global P2P outliers.
+  Output filenames include `SLURM_JOB_ID` when available.
 - `NCCL_INSPECTOR_DUMP_MIN_SIZE_BYTES=<bytes>` (default: `8192`)
   Minimum message size (bytes) to be tracked by inspector.
 - `NCCL_INSPECTOR_DUMP_COLL_RING_SIZE=<entries>` (default: `1024`)
@@ -318,6 +321,9 @@ The size of output files depends on the output format and usage patterns:
 - Each file contains only the most recent metrics snapshot
 - With `NCCL_INSPECTOR_PROM_RETAIN=1` and the dump thread disabled, each file
   contains one final diagnostic summary and remains after process teardown.
+  This retained mode uses bounded online aggregation rather than completed-op
+  rings, compact repeated labels, bounded percentile samples, and device-global
+  top-K outliers.
 - Estimate: ~500-1000 bytes per communicator per metric
 - Example: 8 communicators on one GPU with 3 metrics ≈ 12-24 KB per GPU (fixed size)
 

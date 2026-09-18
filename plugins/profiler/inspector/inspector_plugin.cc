@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include "profiler.h"
 #include "inspector.h"
+#include "inspector_prom.h"
 #include "inspector_ring.h"
 #include "inspector_event_pool.h"
 
@@ -188,10 +189,19 @@ static void inspectorPluginCollInfoCleanup(struct inspectorCollInfo *collInfo) {
 
 static void inspectorUpdateCommOpInfo(struct inspectorCommInfo *commInfo,
                                       struct inspectorCompletedOpInfo *completedOp) {
+  inspectorComputeOpBw(commInfo, completedOp);
+  if (inspectorPromStreamingEnabled()) {
+    inspectorResult_t result = inspectorPromRecordCompleted(commInfo, completedOp);
+    if (result != inspectorSuccess) {
+      INFO_INSPECTOR("Inspector: failed to aggregate completed operation: %s",
+                     inspectorErrorString(result));
+    }
+    return;
+  }
+
   struct inspectorCompletedRing *ring =
     completedOp->isP2p ? &commInfo->completedP2pRing : &commInfo->completedCollRing;
   inspectorLockWr(&commInfo->guard);
-  inspectorComputeOpBw(commInfo, completedOp);
   inspectorRingEnqueue(ring, completedOp);
   if (completedOp->isP2p) {
     commInfo->dump_p2p = inspectorRingNonEmpty(&commInfo->completedP2pRing);

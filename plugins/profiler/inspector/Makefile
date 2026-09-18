@@ -76,7 +76,7 @@ OBJS := $(SRCS:%.cc=$(OBJDIR)/%.o)
 TARGET := libnccl-profiler-inspector.so
 
 # Build rules
-.PHONY: all clean help check-cuda test-ring
+.PHONY: all clean help check-cuda test-ring test-prom-stats
 
 all: check-cuda $(TARGET)
 
@@ -85,6 +85,12 @@ test-ring:
 		tests/inspector_ring_test.cc inspector_ring.cc -o inspector_ring_test
 	./inspector_ring_test
 	rm -f inspector_ring_test
+
+test-prom-stats:
+	$(CXX) $(CXXSTD) -Wall -Wextra $(INCLUDES) \
+		tests/inspector_prom_stats_test.cc -o inspector_prom_stats_test
+	./inspector_prom_stats_test
+	rm -f inspector_prom_stats_test
 
 # Check that CUDA installation exists
 check-cuda:

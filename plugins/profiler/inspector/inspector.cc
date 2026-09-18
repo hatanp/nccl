@@ -63,6 +63,11 @@ static int64_t ncclInspectorDumpIntervalUsecs = -1;
 static bool ncclInspectorInit = false;
 // Global flag to control P2P tracking
 bool enableNcclInspectorP2p = true;
+
+bool inspectorPromStreamingEnabled() {
+  return enableNcclInspectorPromDump && retainNcclInspectorPromDump
+    && !enableNcclInspectorDumpThread;
+}
 // Global flag: require kernel-based timing; discard events without it
 bool requireKernelTiming = true;
 bool inspectorIsDumpVerboseEnabled() {
@@ -1250,9 +1255,13 @@ static inspectorResult_t inspectorFillCommInfo(struct inspectorCommInfo* commInf
   commInfo->dump_coll = false;
   commInfo->dump_p2p = false;
   commInfo->p2pSeqNum = 0;
-  INS_CHK(inspectorRingInit(&commInfo->completedCollRing, ncclInspectorDumpCollRingSize,
+  uint32_t collRingSize
+    = inspectorPromStreamingEnabled() ? 1 : ncclInspectorDumpCollRingSize;
+  uint32_t p2pRingSize
+    = inspectorPromStreamingEnabled() ? 1 : ncclInspectorDumpP2pRingSize;
+  INS_CHK(inspectorRingInit(&commInfo->completedCollRing, collRingSize,
                             sizeof(struct inspectorCompletedOpInfo)));
-  INS_CHK(inspectorRingInit(&commInfo->completedP2pRing, ncclInspectorDumpP2pRingSize,
+  INS_CHK(inspectorRingInit(&commInfo->completedP2pRing, p2pRingSize,
                             sizeof(struct inspectorCompletedOpInfo)));
 
   // Capture current CUDA device ID and convert to UUID string
