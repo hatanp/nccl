@@ -138,6 +138,21 @@ struct inspectorPromStepFamilyAgg {
   uint64_t lastStopTimestampUsecs = 0;
 };
 
+struct inspectorPromStepP2pEvent {
+  ncclFunc_t func;
+  uint64_t sequence;
+  size_t messageSizeBytes;
+  uint64_t commHash;
+  int commRank;
+  int peer;
+  int nranks;
+  int nnodes;
+  uint64_t startTimestampUsecs;
+  uint64_t stopTimestampUsecs;
+  uint64_t execTimeUsecs;
+  inspectorTimingSource_t timingSource;
+};
+
 using inspectorPromCollBucketMap = std::map<inspectorPromCollBucketKey, inspectorPromBucketAgg>;
 using inspectorPromP2pBucketMap = std::map<inspectorPromP2pBucketKey, inspectorPromBucketAgg>;
 
@@ -151,11 +166,13 @@ struct inspectorPromDevice {
   std::vector<inspectorPromGlobalSlowEvent> collSlowest;
   std::vector<inspectorPromGlobalSlowEvent> p2pSlowest;
   std::map<inspectorPromStepFamilyKey, inspectorPromStepFamilyAgg> stepFamilies;
+  std::map<int64_t, std::vector<inspectorPromStepP2pEvent>> stepP2pEvents;
+  std::map<int64_t, uint64_t> stepP2pDropped;
   uint64_t collOverwritten = 0;
   uint64_t p2pOverwritten = 0;
   bool hasData = false;
 };
-static const int kInspectorPromFormatMinor = 4;
+static const int kInspectorPromFormatMinor = 5;
 static const size_t kInspectorPromPercentileSampleCapacity = 256;
 static const size_t kInspectorPromGlobalSlowEventCapacity = 4;
 static std::mutex gInspectorPromStreamingMutex;
@@ -230,6 +247,14 @@ static size_t inspectorPromStepCapacity() {
   return capacity;
 }
 
+static size_t inspectorPromStepP2pCapacity() {
+  static const size_t capacity = []() {
+    int configured = inspectorPromEnvSize("NCCL_INSPECTOR_STEP_P2P_CAPACITY");
+    return configured > 0 ? static_cast<size_t>(configured) : size_t{1024};
+  }();
+  return capacity;
+}
+
 extern "C" __attribute__((visibility("default")))
 int ncclInspectorStepBegin(int64_t step, uint64_t wallTimeNs) {
   (void)wallTimeNs;
@@ -277,6 +302,28 @@ static void inspectorPromStepUpdate(inspectorPromDevice& device,
     agg.firstStartTimestampUsecs, operationStartUsecs);
   agg.lastStopTimestampUsecs = std::max(
     agg.lastStopTimestampUsecs, operationStopUsecs);
+  if (op.isP2p && family == inspectorPromFamilyPpCrossNode) {
+    std::vector<inspectorPromStepP2pEvent>& events
+      = device.stepP2pEvents[gInspectorPromCurrentStep];
+    if (events.size() < inspectorPromStepP2pCapacity()) {
+      events.push_back(inspectorPromStepP2pEvent {
+        op.func,
+        op.sn,
+        op.msgSizeBytes,
+        commInfo->commHash,
+        commInfo->rank,
+        op.peer,
+        commInfo->nranks,
+        commInfo->nnodes,
+        operationStartUsecs,
+        operationStopUsecs,
+        op.execTimeUsecs,
+        op.timingSource
+      });
+    } else {
+      device.stepP2pDropped[gInspectorPromCurrentStep]++;
+    }
+  }
 }
 
 static void inspectorPromAggUpdate(inspectorPromBucketAgg& agg,
@@ -1129,6 +1176,118 @@ static inspectorResult_t inspectorPromWriteStepFamilies(
   return inspectorSuccess;
 }
 
+static inspectorResult_t inspectorPromWriteStepP2pEvents(
+    FILE* file,
+    const std::map<int64_t, std::vector<inspectorPromStepP2pEvent>>& byStep,
+    const std::map<int64_t, uint64_t>& droppedByStep) {
+  if (!file) return inspectorFileOpenError;
+
+  uint64_t retained = 0;
+  uint64_t dropped = 0;
+  for (const auto& entry : byStep) retained += entry.second.size();
+  for (const auto& entry : droppedByStep) dropped += entry.second;
+  char buffer[1024];
+  int infoWritten = snprintf(
+    buffer, sizeof(buffer),
+    "# nccl_inspector_step_p2p_info {\"capacity_per_step\":%zu,"
+    "\"retained_records\":%" PRIu64 ",\"dropped_records\":%" PRIu64
+    ",\"event_fields\":[\"start_delta_us\",\"envelope_us\","
+    "\"duration_us\",\"sequence\"]}\n",
+    inspectorPromStepP2pCapacity(), retained, dropped);
+  if (infoWritten < 0 || (size_t)infoWritten >= sizeof(buffer)) {
+    return inspectorMemoryError;
+  }
+  if (fwrite(buffer, 1, infoWritten, file) != (size_t)infoWritten) {
+    return inspectorFileOpenError;
+  }
+
+  struct GroupKey {
+    ncclFunc_t func;
+    size_t messageSizeBytes;
+    uint64_t commHash;
+    int commRank;
+    int peer;
+    int nranks;
+    int nnodes;
+    inspectorTimingSource_t timingSource;
+
+    bool operator<(const GroupKey& other) const {
+      if (commHash != other.commHash) return commHash < other.commHash;
+      if (commRank != other.commRank) return commRank < other.commRank;
+      if (peer != other.peer) return peer < other.peer;
+      if (func != other.func) return func < other.func;
+      if (messageSizeBytes != other.messageSizeBytes) {
+        return messageSizeBytes < other.messageSizeBytes;
+      }
+      if (nranks != other.nranks) return nranks < other.nranks;
+      if (nnodes != other.nnodes) return nnodes < other.nnodes;
+      return timingSource < other.timingSource;
+    }
+  };
+
+  for (const auto& stepEntry : byStep) {
+    std::map<GroupKey, std::vector<inspectorPromStepP2pEvent>> groups;
+    for (const inspectorPromStepP2pEvent& event : stepEntry.second) {
+      groups[GroupKey {
+        event.func, event.messageSizeBytes, event.commHash, event.commRank,
+        event.peer, event.nranks, event.nnodes, event.timingSource
+      }].push_back(event);
+    }
+    for (auto& groupEntry : groups) {
+      const GroupKey& key = groupEntry.first;
+      std::vector<inspectorPromStepP2pEvent>& events = groupEntry.second;
+      std::sort(
+        events.begin(), events.end(),
+        [](const inspectorPromStepP2pEvent& lhs,
+           const inspectorPromStepP2pEvent& rhs) {
+          if (lhs.startTimestampUsecs != rhs.startTimestampUsecs) {
+            return lhs.startTimestampUsecs < rhs.startTimestampUsecs;
+          }
+          return lhs.sequence < rhs.sequence;
+        });
+      uint64_t base = events.front().startTimestampUsecs;
+      int prefixWritten = snprintf(
+        buffer, sizeof(buffer),
+        "# nccl_inspector_step_p2p {\"step\":%" PRId64
+        ",\"operation\":\"%s\",\"message_size_bytes\":%zu"
+        ",\"comm_id\":\"%016" PRIx64 "\",\"comm_rank\":%d"
+        ",\"peer\":%d,\"nranks\":%d,\"n_nodes\":%d"
+        ",\"timing_source\":\"%s\",\"start_base_us\":%" PRIu64
+        ",\"events\":[",
+        stepEntry.first, ncclFuncToString(key.func), key.messageSizeBytes,
+        key.commHash, key.commRank, key.peer, key.nranks, key.nnodes,
+        inspectorTimingSourceToString(key.timingSource), base);
+      if (prefixWritten < 0 || (size_t)prefixWritten >= sizeof(buffer)) {
+        return inspectorMemoryError;
+      }
+      if (fwrite(buffer, 1, prefixWritten, file) != (size_t)prefixWritten) {
+        return inspectorFileOpenError;
+      }
+      for (size_t index = 0; index < events.size(); index++) {
+        const inspectorPromStepP2pEvent& event = events[index];
+        uint64_t envelope = event.stopTimestampUsecs >= event.startTimestampUsecs
+          ? event.stopTimestampUsecs - event.startTimestampUsecs : 0;
+        int eventWritten = snprintf(
+          buffer, sizeof(buffer), "%s[%" PRIu64 ",%" PRIu64 ",%" PRIu64
+          ",%" PRIu64 "]", index ? "," : "",
+          event.startTimestampUsecs - base, envelope, event.execTimeUsecs,
+          event.sequence);
+        if (eventWritten < 0 || (size_t)eventWritten >= sizeof(buffer)) {
+          return inspectorMemoryError;
+        }
+        if (fwrite(buffer, 1, eventWritten, file) != (size_t)eventWritten) {
+          return inspectorFileOpenError;
+        }
+      }
+      static const char suffix[] = "]}\n";
+      if (fwrite(suffix, 1, sizeof(suffix) - 1, file) != sizeof(suffix) - 1) {
+        return inspectorFileOpenError;
+      }
+    }
+  }
+  return inspectorSuccess;
+}
+
 /*
  * Description:
  *
@@ -1422,6 +1581,8 @@ static inspectorResult_t inspectorPromWriteDeviceBuckets(std::map<std::string,
       file, "nccl_p2p_slow_event_exec_time_microseconds",
       device.p2pSlowest));
     INS_CHK(inspectorPromWriteStepFamilies(file, device.stepFamilies));
+    INS_CHK(inspectorPromWriteStepP2pEvents(
+      file, device.stepP2pEvents, device.stepP2pDropped));
   }
   return inspectorSuccess;
 }

@@ -110,6 +110,17 @@ export NCCL_INSPECTOR_DUMP_THREAD_INTERVAL_MICROSECONDS=500
   Comm pool initial size/stride.
 - `NCCL_INSPECTOR_REQUIRE_KERNEL_TIMING=<0|1>` (default: `1`)
   When enabled (default), only events with GPU-based kernel timing (`kernel_gpu`) are recorded. Events that fall back to CPU-measured timing (`kernel_cpu` or `collective_cpu`) are silently discarded. Set to `0` to restore the previous fallback behaviour and retain all events regardless of timing source.
+- `NCCL_INSPECTOR_STEP_ENABLE=<0|1>` (default: `0`)
+  Enables application-delimited, bounded per-step summaries through the
+  exported `ncclInspectorStepBegin` and `ncclInspectorStepEnd` APIs.
+- `NCCL_INSPECTOR_STEP_CAPACITY=<steps>` (default: `128`)
+  Maximum number of distinct application steps retained per process.
+- `NCCL_INSPECTOR_STEP_P2P_CAPACITY=<events-per-step>` (default: `1024`)
+  Maximum number of cross-node P2P kernel records retained for each accepted
+  step. Records are grouped compactly at finalization by communicator,
+  direction, peer, message size, and timing source. Output includes start and
+  envelope timing plus measured kernel duration; these values include peer
+  waiting and backpressure and are not pure wire-transfer time.
 
 ### Debugging
 
@@ -323,7 +334,9 @@ The size of output files depends on the output format and usage patterns:
   contains one final diagnostic summary and remains after process teardown.
   This retained mode uses bounded online aggregation rather than completed-op
   rings, compact repeated labels, bounded percentile samples, and device-global
-  top-K outliers.
+  top-K outliers. When step P2P retention is enabled, file size additionally
+  grows with the configured step and per-step P2P capacities, while remaining
+  hard bounded.
 - Estimate: ~500-1000 bytes per communicator per metric
 - Example: 8 communicators on one GPU with 3 metrics ≈ 12-24 KB per GPU (fixed size)
 
