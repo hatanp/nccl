@@ -19,6 +19,7 @@
 #include <map>
 #include <limits>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 #include <cmath>
@@ -117,6 +118,26 @@ struct inspectorPromP2pBucketKey {
   }
 };
 
+struct inspectorPromStepFamilyKey {
+  int64_t step;
+  inspectorPromSemanticFamily family;
+  ncclFunc_t func;
+
+  bool operator<(const inspectorPromStepFamilyKey& other) const {
+    if (step != other.step) return step < other.step;
+    if (family != other.family) return family < other.family;
+    return func < other.func;
+  }
+};
+
+struct inspectorPromStepFamilyAgg {
+  uint64_t count = 0;
+  double execTimeSum = 0.0;
+  uint64_t execTimeMax = 0;
+  uint64_t firstStartTimestampUsecs = std::numeric_limits<uint64_t>::max();
+  uint64_t lastStopTimestampUsecs = 0;
+};
+
 using inspectorPromCollBucketMap = std::map<inspectorPromCollBucketKey, inspectorPromBucketAgg>;
 using inspectorPromP2pBucketMap = std::map<inspectorPromP2pBucketKey, inspectorPromBucketAgg>;
 
@@ -129,15 +150,106 @@ struct inspectorPromDevice {
   inspectorPromP2pBucketMap p2pBuckets;
   std::vector<inspectorPromGlobalSlowEvent> collSlowest;
   std::vector<inspectorPromGlobalSlowEvent> p2pSlowest;
+  std::map<inspectorPromStepFamilyKey, inspectorPromStepFamilyAgg> stepFamilies;
   uint64_t collOverwritten = 0;
   uint64_t p2pOverwritten = 0;
   bool hasData = false;
 };
-static const int kInspectorPromFormatMinor = 3;
+static const int kInspectorPromFormatMinor = 4;
 static const size_t kInspectorPromPercentileSampleCapacity = 256;
 static const size_t kInspectorPromGlobalSlowEventCapacity = 4;
 static std::mutex gInspectorPromStreamingMutex;
 static std::map<std::string, inspectorPromDevice> gInspectorPromStreamingDevices;
+static int64_t gInspectorPromCurrentStep = -1;
+static std::set<int64_t> gInspectorPromRetainedSteps;
+
+static bool inspectorPromStepEnabled() {
+  static const bool enabled = []() {
+    const char* value = getenv("NCCL_INSPECTOR_STEP_ENABLE");
+    return value != nullptr && strcmp(value, "1") == 0;
+  }();
+  return enabled;
+}
+
+static int inspectorPromEnvSize(const char* name) {
+  const char* value = getenv(name);
+  if (value == nullptr || value[0] == '\0') return 0;
+  char* end = nullptr;
+  long parsed = strtol(value, &end, 10);
+  if (end == value || *end != '\0' || parsed <= 0
+      || parsed > std::numeric_limits<int>::max()) {
+    return 0;
+  }
+  return static_cast<int>(parsed);
+}
+
+static inspectorPromTopologySizes inspectorPromGetTopologySizes() {
+  static const inspectorPromTopologySizes sizes = []() {
+    inspectorPromTopologySizes configured;
+    configured.world = inspectorPromEnvSize("NCCL_INSPECTOR_WORLD_SIZE");
+    configured.dp = inspectorPromEnvSize("NCCL_INSPECTOR_DP_SIZE");
+    configured.edp = inspectorPromEnvSize("NCCL_INSPECTOR_EDP_SIZE");
+    configured.ep = inspectorPromEnvSize("NCCL_INSPECTOR_EP_SIZE");
+    configured.pp = inspectorPromEnvSize("NCCL_INSPECTOR_PP_SIZE");
+    return configured;
+  }();
+  return sizes;
+}
+
+static size_t inspectorPromStepCapacity() {
+  static const size_t capacity = []() {
+    int configured = inspectorPromEnvSize("NCCL_INSPECTOR_STEP_CAPACITY");
+    return configured > 0 ? static_cast<size_t>(configured) : size_t{128};
+  }();
+  return capacity;
+}
+
+extern "C" __attribute__((visibility("default")))
+int ncclInspectorStepBegin(int64_t step, uint64_t wallTimeNs) {
+  (void)wallTimeNs;
+  if (!inspectorPromStepEnabled()) return 0;
+  std::lock_guard<std::mutex> lock(gInspectorPromStreamingMutex);
+  if (gInspectorPromRetainedSteps.count(step) == 0
+      && gInspectorPromRetainedSteps.size() >= inspectorPromStepCapacity()) {
+    gInspectorPromCurrentStep = -1;
+    return 0;
+  }
+  gInspectorPromRetainedSteps.insert(step);
+  gInspectorPromCurrentStep = step;
+  return 0;
+}
+
+extern "C" __attribute__((visibility("default")))
+int ncclInspectorStepEnd(int64_t step, uint64_t wallTimeNs) {
+  (void)wallTimeNs;
+  if (!inspectorPromStepEnabled()) return 0;
+  std::lock_guard<std::mutex> lock(gInspectorPromStreamingMutex);
+  if (gInspectorPromCurrentStep == step) {
+    gInspectorPromCurrentStep = -1;
+  }
+  return 0;
+}
+
+static void inspectorPromStepUpdate(inspectorPromDevice& device,
+                                    const inspectorCommInfo* commInfo,
+                                    const inspectorCompletedOpInfo& op) {
+  if (!inspectorPromStepEnabled() || gInspectorPromCurrentStep < 0) return;
+  inspectorPromTopologySizes sizes = inspectorPromGetTopologySizes();
+  inspectorPromSemanticFamily family = inspectorPromClassifyFamily(
+    op.isP2p, commInfo->nranks, commInfo->nnodes, sizes);
+  if (family == inspectorPromFamilyUnknown) return;
+  inspectorPromStepFamilyKey key {gInspectorPromCurrentStep, family, op.func};
+  inspectorPromStepFamilyAgg& agg = device.stepFamilies[key];
+  agg.count++;
+  agg.execTimeSum += static_cast<double>(op.execTimeUsecs);
+  agg.execTimeMax = std::max(agg.execTimeMax, op.execTimeUsecs);
+  agg.firstStartTimestampUsecs = std::min(
+    agg.firstStartTimestampUsecs,
+    op.evtTrk.evntTrace[NCCL_INSP_EVT_TRK_OP_START].ts);
+  agg.lastStopTimestampUsecs = std::max(
+    agg.lastStopTimestampUsecs,
+    op.evtTrk.evntTrace[NCCL_INSP_EVT_TRK_OP_STOP].ts);
+}
 
 static void inspectorPromAggUpdate(inspectorPromBucketAgg& agg,
                                    const inspectorCompletedOpInfo& op) {
@@ -580,6 +692,8 @@ inspectorResult_t inspectorPromRecordCompleted(inspectorCommInfo* commInfo,
     inspectorPromAddGlobalSlowEvent(device.collSlowest, labels, *op);
   }
 
+  inspectorPromStepUpdate(device, commInfo, *op);
+
   device.hasData = true;
   return inspectorSuccess;
 }
@@ -945,6 +1059,48 @@ static inspectorResult_t inspectorPromWriteGlobalSlowEvents(
   return inspectorSuccess;
 }
 
+static inspectorResult_t inspectorPromWriteStepFamilies(
+    FILE* file,
+    const std::map<inspectorPromStepFamilyKey,
+                   inspectorPromStepFamilyAgg>& stepFamilies) {
+  if (!file) return inspectorFileOpenError;
+
+  char buffer[1024];
+  int infoWritten = snprintf(
+    buffer, sizeof(buffer),
+    "# nccl_inspector_step_info {\"capacity\":%zu,\"retained_steps\":%zu}\n",
+    inspectorPromStepCapacity(), gInspectorPromRetainedSteps.size());
+  if (infoWritten < 0 || (size_t)infoWritten >= sizeof(buffer)) {
+    return inspectorMemoryError;
+  }
+  if (fwrite(buffer, 1, infoWritten, file) != (size_t)infoWritten) {
+    return inspectorFileOpenError;
+  }
+  for (const auto& entry : stepFamilies) {
+    const inspectorPromStepFamilyKey& key = entry.first;
+    const inspectorPromStepFamilyAgg& agg = entry.second;
+    uint64_t firstStart = agg.count ? agg.firstStartTimestampUsecs : 0;
+    int written = snprintf(
+      buffer, sizeof(buffer),
+      "# nccl_inspector_step {\"step\":%" PRId64
+      ",\"family\":\"%s\",\"operation\":\"%s\""
+      ",\"count\":%" PRIu64 ",\"sum_us\":%.6g"
+      ",\"max_us\":%" PRIu64
+      ",\"first_start_us\":%" PRIu64 ",\"last_stop_us\":%" PRIu64
+      "}\n",
+      key.step, inspectorPromSemanticFamilyName(key.family),
+      ncclFuncToString(key.func), agg.count, agg.execTimeSum,
+      agg.execTimeMax, firstStart, agg.lastStopTimestampUsecs);
+    if (written < 0 || (size_t)written >= sizeof(buffer)) {
+      return inspectorMemoryError;
+    }
+    if (fwrite(buffer, 1, written, file) != (size_t)written) {
+      return inspectorFileOpenError;
+    }
+  }
+  return inspectorSuccess;
+}
+
 /*
  * Description:
  *
@@ -1237,6 +1393,7 @@ static inspectorResult_t inspectorPromWriteDeviceBuckets(std::map<std::string,
     INS_CHK(inspectorPromWriteGlobalSlowEvents(
       file, "nccl_p2p_slow_event_exec_time_microseconds",
       device.p2pSlowest));
+    INS_CHK(inspectorPromWriteStepFamilies(file, device.stepFamilies));
   }
   return inspectorSuccess;
 }

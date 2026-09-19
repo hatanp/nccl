@@ -14,6 +14,61 @@
 #include <utility>
 #include <vector>
 
+enum inspectorPromSemanticFamily {
+  inspectorPromFamilyUnknown = 0,
+  inspectorPromFamilyDp,
+  inspectorPromFamilyEdp,
+  inspectorPromFamilyEp,
+  inspectorPromFamilyGlobal,
+  inspectorPromFamilyPpLocal,
+  inspectorPromFamilyPpCrossNode
+};
+
+struct inspectorPromTopologySizes {
+  int world = 0;
+  int dp = 0;
+  int edp = 0;
+  int ep = 0;
+  int pp = 0;
+};
+
+static inline inspectorPromSemanticFamily inspectorPromClassifyFamily(
+    bool isP2p,
+    int nranks,
+    int nnodes,
+    const inspectorPromTopologySizes& sizes) {
+  if (isP2p) {
+    return nnodes > 1 ? inspectorPromFamilyPpCrossNode
+                      : inspectorPromFamilyPpLocal;
+  }
+  if (sizes.world > 0 && nranks == sizes.world) {
+    return inspectorPromFamilyGlobal;
+  }
+  if (sizes.dp > 0 && nranks == sizes.dp) {
+    return inspectorPromFamilyDp;
+  }
+  if (sizes.edp > 0 && nranks == sizes.edp) {
+    return inspectorPromFamilyEdp;
+  }
+  if (sizes.ep > 0 && nranks == sizes.ep) {
+    return inspectorPromFamilyEp;
+  }
+  return inspectorPromFamilyUnknown;
+}
+
+static inline const char* inspectorPromSemanticFamilyName(
+    inspectorPromSemanticFamily family) {
+  switch (family) {
+    case inspectorPromFamilyDp: return "dp";
+    case inspectorPromFamilyEdp: return "edp";
+    case inspectorPromFamilyEp: return "ep";
+    case inspectorPromFamilyGlobal: return "global";
+    case inspectorPromFamilyPpLocal: return "pp_local";
+    case inspectorPromFamilyPpCrossNode: return "pp_cross_node";
+    default: return "unknown";
+  }
+}
+
 static inline uint64_t inspectorPromMix64(uint64_t value) {
   value += 0x9e3779b97f4a7c15ULL;
   value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;

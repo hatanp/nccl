@@ -11,6 +11,17 @@
 #include <stdio.h>
 #include "inspector.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+int ncclInspectorStepBegin(int64_t step, uint64_t wallTimeNs);
+int ncclInspectorStepEnd(int64_t step, uint64_t wallTimeNs);
+
+#ifdef __cplusplus
+}
+#endif
+
 // Forward declarations
 struct inspectorCommInfoList;
 struct inspectorDumpThread;
