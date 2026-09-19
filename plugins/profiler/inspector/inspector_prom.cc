@@ -196,6 +196,32 @@ static inspectorPromTopologySizes inspectorPromGetTopologySizes() {
   return sizes;
 }
 
+static void inspectorPromOperationEnvelopeUsecs(
+    const inspectorCompletedOpInfo& op,
+    uint64_t* startUsecs,
+    uint64_t* stopUsecs) {
+  *startUsecs = std::numeric_limits<uint64_t>::max();
+  *stopUsecs = 0;
+  if (op.timingSource == inspectorTimingSourceKernelGpu
+      || op.timingSource == inspectorTimingSourceKernelCpu) {
+    uint32_t channels = std::min(op.evtTrk.nChannels,
+                                 static_cast<uint32_t>(MAX_CHANNELS));
+    for (uint32_t channel = 0; channel < channels; channel++) {
+      const inspectorEventTraceInfo* trace
+        = op.evtTrk.kernelCh[channel].evntTrace;
+      uint64_t start = trace[NCCL_INSP_EVT_TRK_KERNEL_START].ts;
+      uint64_t stop = trace[NCCL_INSP_EVT_TRK_KERNEL_STOP].ts;
+      if (start > 0) *startUsecs = std::min(*startUsecs, start);
+      if (stop > 0) *stopUsecs = std::max(*stopUsecs, stop);
+    }
+  }
+  if (*startUsecs == std::numeric_limits<uint64_t>::max()
+      || *stopUsecs == 0) {
+    *startUsecs = op.evtTrk.evntTrace[NCCL_INSP_EVT_TRK_OP_START].ts;
+    *stopUsecs = op.evtTrk.evntTrace[NCCL_INSP_EVT_TRK_OP_STOP].ts;
+  }
+}
+
 static size_t inspectorPromStepCapacity() {
   static const size_t capacity = []() {
     int configured = inspectorPromEnvSize("NCCL_INSPECTOR_STEP_CAPACITY");
@@ -240,15 +266,17 @@ static void inspectorPromStepUpdate(inspectorPromDevice& device,
   if (family == inspectorPromFamilyUnknown) return;
   inspectorPromStepFamilyKey key {gInspectorPromCurrentStep, family, op.func};
   inspectorPromStepFamilyAgg& agg = device.stepFamilies[key];
+  uint64_t operationStartUsecs;
+  uint64_t operationStopUsecs;
+  inspectorPromOperationEnvelopeUsecs(
+    op, &operationStartUsecs, &operationStopUsecs);
   agg.count++;
   agg.execTimeSum += static_cast<double>(op.execTimeUsecs);
   agg.execTimeMax = std::max(agg.execTimeMax, op.execTimeUsecs);
   agg.firstStartTimestampUsecs = std::min(
-    agg.firstStartTimestampUsecs,
-    op.evtTrk.evntTrace[NCCL_INSP_EVT_TRK_OP_START].ts);
+    agg.firstStartTimestampUsecs, operationStartUsecs);
   agg.lastStopTimestampUsecs = std::max(
-    agg.lastStopTimestampUsecs,
-    op.evtTrk.evntTrace[NCCL_INSP_EVT_TRK_OP_STOP].ts);
+    agg.lastStopTimestampUsecs, operationStopUsecs);
 }
 
 static void inspectorPromAggUpdate(inspectorPromBucketAgg& agg,
