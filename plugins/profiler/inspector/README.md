@@ -122,6 +122,11 @@ export NCCL_INSPECTOR_DUMP_THREAD_INTERVAL_MICROSECONDS=500
   envelope timing plus measured kernel duration; these values include peer
   waiting and backpressure and are not pure wire-transfer time.
 
+Per-step family records retain both the NCCL operation callback start and the
+kernel-channel start for the operation with the earliest kernel start. Their
+delta distinguishes a late operation/graph boundary from delay between NCCL
+operation creation and kernel-channel execution.
+
 ### Debugging
 
 To see detailed Inspector plugin messages, use NCCL's debug subsystem filtering. The Inspector uses the `PROFILE` subsystem:

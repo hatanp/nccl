@@ -135,6 +135,7 @@ struct inspectorPromStepFamilyAgg {
   double execTimeSum = 0.0;
   uint64_t execTimeMax = 0;
   uint64_t firstStartTimestampUsecs = std::numeric_limits<uint64_t>::max();
+  uint64_t firstOperationStartTimestampUsecs = 0;
   uint64_t lastStopTimestampUsecs = 0;
 };
 
@@ -172,7 +173,7 @@ struct inspectorPromDevice {
   uint64_t p2pOverwritten = 0;
   bool hasData = false;
 };
-static const int kInspectorPromFormatMinor = 5;
+static const int kInspectorPromFormatMinor = 6;
 static const size_t kInspectorPromPercentileSampleCapacity = 256;
 static const size_t kInspectorPromGlobalSlowEventCapacity = 4;
 static std::mutex gInspectorPromStreamingMutex;
@@ -298,8 +299,11 @@ static void inspectorPromStepUpdate(inspectorPromDevice& device,
   agg.count++;
   agg.execTimeSum += static_cast<double>(op.execTimeUsecs);
   agg.execTimeMax = std::max(agg.execTimeMax, op.execTimeUsecs);
-  agg.firstStartTimestampUsecs = std::min(
-    agg.firstStartTimestampUsecs, operationStartUsecs);
+  if (operationStartUsecs < agg.firstStartTimestampUsecs) {
+    agg.firstStartTimestampUsecs = operationStartUsecs;
+    agg.firstOperationStartTimestampUsecs
+      = op.evtTrk.evntTrace[NCCL_INSP_EVT_TRK_OP_START].ts;
+  }
   agg.lastStopTimestampUsecs = std::max(
     agg.lastStopTimestampUsecs, operationStopUsecs);
   if (op.isP2p && family == inspectorPromFamilyPpCrossNode) {
@@ -1155,17 +1159,21 @@ static inspectorResult_t inspectorPromWriteStepFamilies(
     const inspectorPromStepFamilyKey& key = entry.first;
     const inspectorPromStepFamilyAgg& agg = entry.second;
     uint64_t firstStart = agg.count ? agg.firstStartTimestampUsecs : 0;
+    uint64_t firstOperationStart
+      = agg.count ? agg.firstOperationStartTimestampUsecs : 0;
     int written = snprintf(
       buffer, sizeof(buffer),
       "# nccl_inspector_step {\"step\":%" PRId64
       ",\"family\":\"%s\",\"operation\":\"%s\""
       ",\"count\":%" PRIu64 ",\"sum_us\":%.6g"
       ",\"max_us\":%" PRIu64
+      ",\"first_op_start_us\":%" PRIu64
       ",\"first_start_us\":%" PRIu64 ",\"last_stop_us\":%" PRIu64
       "}\n",
       key.step, inspectorPromSemanticFamilyName(key.family),
       ncclFuncToString(key.func), agg.count, agg.execTimeSum,
-      agg.execTimeMax, firstStart, agg.lastStopTimestampUsecs);
+      agg.execTimeMax, firstOperationStart, firstStart,
+      agg.lastStopTimestampUsecs);
     if (written < 0 || (size_t)written >= sizeof(buffer)) {
       return inspectorMemoryError;
     }
