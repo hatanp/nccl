@@ -77,7 +77,7 @@ OBJS := $(SRCS:%.cc=$(OBJDIR)/%.o)
 TARGET := libnccl-profiler-inspector.so
 
 # Build rules
-.PHONY: all clean help check-cuda test-ring test-prom-stats test-proxy-stats test-proxy-pool
+.PHONY: all clean help check-cuda test-ring test-prom-stats test-proxy-stats test-proxy-pool test-proxy-lifecycle
 
 all: check-cuda $(TARGET)
 
@@ -104,6 +104,13 @@ test-proxy-pool:
 		tests/inspector_proxy_pool_test.cc inspector_proxy_pool.cc -o inspector_proxy_pool_test
 	./inspector_proxy_pool_test
 	rm -f inspector_proxy_pool_test
+
+test-proxy-lifecycle: all
+	$(CXX) $(CXXSTD) -Wall -Wextra $(INCLUDES) \
+		tests/inspector_proxy_lifecycle_test.cc -L. \
+		-Wl,-rpath,'$$ORIGIN' -lnccl-profiler-inspector -o inspector_proxy_lifecycle_test
+	./inspector_proxy_lifecycle_test
+	rm -f inspector_proxy_lifecycle_test
 
 # Check that CUDA installation exists
 check-cuda:
