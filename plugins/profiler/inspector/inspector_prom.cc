@@ -12,6 +12,7 @@
 #include "inspector_proxy_pool.h"
 #include "inspector_proxy_stats.h"
 #include "inspector_ring.h"
+#include "profiler.h"
 
 #include <stdio.h>
 #include <stdlib.h>
