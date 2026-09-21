@@ -476,23 +476,21 @@ static void inspectorPluginProxyOpInfoInit(
     ncclProfilerEventDescr_t* eDescr,
     struct inspectorCommInfo* commInfo) {
   *proxyOp = nullptr;
-  if (!enableNcclInspectorProxyStep || commInfo == nullptr) return;
+  if (!enableNcclInspectorProxyStep) return;
   int64_t applicationStep = inspectorPromCurrentStep();
   if (applicationStep < 0) return;
   bool detached = eDescr->proxyOp.pid != getpid();
   // PXN can execute an operation in a different process. In that case the
-  // parentObj value belongs to the originating address space and must never
-  // be dereferenced here. The local communicator context is still valid, so
-  // retain proxy phases under an explicit PXN family without claiming the
-  // originating collective family or its exact application-step identity.
+  // parentObj and profiler context values belong to the originating address
+  // space and must never be dereferenced here. Retain proxy phases in a
+  // process-local detached aggregation without claiming communicator or exact
+  // originating application-step identity.
   if (!detached && eDescr->parentObj == nullptr) return;
+  if (!detached && commInfo == nullptr) return;
   inspectorProxyOpInfo* event = inspectorProxyPoolAllocOp();
   if (event == nullptr) return;
   event->type = ncclProfileProxyOp;
-  event->commInfo = commInfo;
   event->rank = eDescr->rank;
-  event->nranks = commInfo->nranks;
-  event->nnodes = commInfo->nnodes;
   event->channelId = eDescr->proxyOp.channelId;
   event->peer = eDescr->proxyOp.peer;
   event->isSend = eDescr->proxyOp.isSend;
@@ -513,6 +511,9 @@ static void inspectorPluginProxyOpInfoInit(
     *proxyOp = event;
     return;
   }
+  event->commInfo = commInfo;
+  event->nranks = commInfo->nranks;
+  event->nnodes = commInfo->nnodes;
   uint64_t parentType = *static_cast<uint64_t*>(eDescr->parentObj);
   if (parentType != ncclProfileColl && parentType != ncclProfileP2p) {
     inspectorProxyPoolReleaseOp(event);

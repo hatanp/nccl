@@ -210,6 +210,8 @@ static const size_t kInspectorPromPercentileSampleCapacity = 256;
 static const size_t kInspectorPromGlobalSlowEventCapacity = 4;
 static std::mutex gInspectorPromStreamingMutex;
 static std::map<std::string, inspectorPromDevice> gInspectorPromStreamingDevices;
+static std::map<inspectorPromStepProxyKey,
+                inspectorPromStepProxyAgg> gInspectorPromDetachedProxy;
 static std::atomic<int64_t> gInspectorPromCurrentStep {-1};
 static std::set<int64_t> gInspectorPromRetainedSteps;
 
@@ -370,7 +372,7 @@ int64_t inspectorPromCurrentStep() {
 
 inspectorResult_t inspectorPromRecordProxyOp(
     const inspectorProxyOpInfo* op) {
-  if (op == nullptr || op->commInfo == nullptr || op->applicationStep < 0) {
+  if (op == nullptr || op->applicationStep < 0) {
     return inspectorSuccess;
   }
   inspectorPromTopologySizes sizes = inspectorPromGetTopologySizes();
@@ -380,13 +382,22 @@ inspectorResult_t inspectorPromRecordProxyOp(
         op->parentType == ncclProfileP2p, op->nranks, op->nnodes, sizes);
   if (family == inspectorPromFamilyUnknown) return inspectorSuccess;
   std::lock_guard<std::mutex> lock(gInspectorPromStreamingMutex);
-  inspectorPromDevice& device =
-    gInspectorPromStreamingDevices[op->commInfo->deviceUuidStr];
-  inspectorPromInitDevice(device, op->commInfo);
   inspectorPromStepProxyKey key {
     op->applicationStep, family, op->func, op->messageSizeBytes, op->isSend != 0
   };
-  inspectorPromStepProxyAgg& agg = device.stepProxy[key];
+  inspectorPromStepProxyAgg* aggPtr = nullptr;
+  inspectorPromDevice* devicePtr = nullptr;
+  if (op->detached) {
+    aggPtr = &gInspectorPromDetachedProxy[key];
+  } else {
+    if (op->commInfo == nullptr) return inspectorSuccess;
+    inspectorPromDevice& device =
+      gInspectorPromStreamingDevices[op->commInfo->deviceUuidStr];
+    inspectorPromInitDevice(device, op->commInfo);
+    aggPtr = &device.stepProxy[key];
+    devicePtr = &device;
+  }
+  inspectorPromStepProxyAgg& agg = *aggPtr;
   agg.count += op->proxyStepCount;
   agg.transferBytes += op->transferSizeBytes;
   agg.unknownTransferSizes += op->unknownTransferSizes;
@@ -397,7 +408,7 @@ inspectorResult_t inspectorPromRecordProxyOp(
     agg.phaseMaxUsecs[phase] = std::max(
       agg.phaseMaxUsecs[phase], op->phaseMaxUsecs[phase]);
   }
-  device.hasData = true;
+  if (devicePtr != nullptr) devicePtr->hasData = true;
   return inspectorSuccess;
 }
 
@@ -849,9 +860,12 @@ inspectorResult_t inspectorPromRecordCompleted(inspectorCommInfo* commInfo,
 }
 
 static void inspectorPromTakeStreamingDevices(
-    std::map<std::string, inspectorPromDevice>& devices) {
+    std::map<std::string, inspectorPromDevice>& devices,
+    std::map<inspectorPromStepProxyKey,
+             inspectorPromStepProxyAgg>& detachedProxy) {
   std::lock_guard<std::mutex> lock(gInspectorPromStreamingMutex);
   devices.swap(gInspectorPromStreamingDevices);
+  detachedProxy.swap(gInspectorPromDetachedProxy);
 }
 
 /*
@@ -1747,6 +1761,21 @@ inspectorResult_t inspectorPromCommInfoListDump(struct inspectorCommInfoList* co
   return inspectorPromCommInfoListsDump(commList, nullptr, output_root, dumpThread);
 }
 
+static void inspectorPromMergeStepProxyAgg(
+    inspectorPromStepProxyAgg& target,
+    const inspectorPromStepProxyAgg& source) {
+  target.count += source.count;
+  target.transferBytes += source.transferBytes;
+  target.unknownTransferSizes += source.unknownTransferSizes;
+  target.missingTransitions += source.missingTransitions;
+  for (int phase = 0; phase < inspectorProxyWaitPhaseCount; phase++) {
+    target.phaseCount[phase] += source.phaseCount[phase];
+    target.phaseSumUsecs[phase] += source.phaseSumUsecs[phase];
+    target.phaseMaxUsecs[phase] = std::max(
+      target.phaseMaxUsecs[phase], source.phaseMaxUsecs[phase]);
+  }
+}
+
 inspectorResult_t inspectorPromCommInfoListsDump(struct inspectorCommInfoList* first,
                                                  struct inspectorCommInfoList* second,
                                                  const char* output_root,
@@ -1756,7 +1785,9 @@ inspectorResult_t inspectorPromCommInfoListsDump(struct inspectorCommInfoList* f
   uint32_t totalComms = 0;
   uint64_t currentTime = inspectorGetTime();
   std::map<std::string, inspectorPromDevice> devices;
-  inspectorPromTakeStreamingDevices(devices);
+  std::map<inspectorPromStepProxyKey,
+           inspectorPromStepProxyAgg> detachedProxy;
+  inspectorPromTakeStreamingDevices(devices, detachedProxy);
 
   struct inspectorCommInfoList* lists[] = {first, second};
   for (size_t i = 0; i < 2; i++) {
@@ -1777,6 +1808,26 @@ inspectorResult_t inspectorPromCommInfoListsDump(struct inspectorCommInfoList* f
     } else {
       INS_CHK_GOTO(inspectorUnlockRWLock(&commList->guard), res, exit);
     }
+  }
+
+  if (!detachedProxy.empty()) {
+    if (devices.empty()) {
+      const char* worldRank = getenv("SLURM_PROCID");
+      char deviceKey[128];
+      snprintf(deviceKey, sizeof(deviceKey), "pxn-rank%s-pid%d",
+               worldRank ? worldRank : "unknown", getpid());
+      inspectorPromDevice& detachedDevice = devices[deviceKey];
+      detachedDevice.deviceUuidStr = deviceKey;
+      char nodeName[256];
+      inspectorPromGetNodeName(nodeName, sizeof(nodeName));
+      detachedDevice.nodeName = nodeName;
+      detachedDevice.gpuName = "PXN";
+    }
+    inspectorPromDevice& device = devices.begin()->second;
+    for (const auto& entry : detachedProxy) {
+      inspectorPromMergeStepProxyAgg(device.stepProxy[entry.first], entry.second);
+    }
+    device.hasData = true;
   }
 
   if (!devices.empty()) {
