@@ -1,6 +1,7 @@
 #include "inspector_proxy_pool.h"
 
 #include <stddef.h>
+#include <atomic>
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
@@ -23,6 +24,7 @@ struct inspectorFixedProxyPool {
 
 static inspectorFixedProxyPool<inspectorProxyOpInfo> gOpPool;
 static inspectorFixedProxyPool<inspectorProxyStepInfo> gStepPool;
+static std::atomic<uint64_t> gDetachedOps {0};
 
 template <typename T>
 static bool initializePool(inspectorFixedProxyPool<T>& pool, uint32_t capacity) {
@@ -75,6 +77,7 @@ inspectorResult_t inspectorProxyPoolInit(uint32_t opCapacity,
                                          uint32_t stepCapacity) {
   if (opCapacity == 0 || stepCapacity == 0) return inspectorMemoryError;
   if (!initializePool(gOpPool, opCapacity)) return inspectorMemoryError;
+  gDetachedOps.store(0, std::memory_order_relaxed);
   if (!initializePool(gStepPool, stepCapacity)) {
     free(gOpPool.entries);
     gOpPool.entries = nullptr;
@@ -114,3 +117,9 @@ void inspectorProxyPoolReleaseStep(struct inspectorProxyStepInfo* step) {
 
 uint64_t inspectorProxyPoolDroppedOps() { return gOpPool.dropped; }
 uint64_t inspectorProxyPoolDroppedSteps() { return gStepPool.dropped; }
+void inspectorProxyPoolRecordDetachedOp() {
+  gDetachedOps.fetch_add(1, std::memory_order_relaxed);
+}
+uint64_t inspectorProxyPoolDetachedOps() {
+  return gDetachedOps.load(std::memory_order_relaxed);
+}

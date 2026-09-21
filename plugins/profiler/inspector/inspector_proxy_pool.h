@@ -14,5 +14,7 @@ void inspectorProxyPoolReleaseOp(struct inspectorProxyOpInfo* op);
 void inspectorProxyPoolReleaseStep(struct inspectorProxyStepInfo* step);
 uint64_t inspectorProxyPoolDroppedOps();
 uint64_t inspectorProxyPoolDroppedSteps();
+void inspectorProxyPoolRecordDetachedOp();
+uint64_t inspectorProxyPoolDetachedOps();
 
 #endif

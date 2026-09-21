@@ -96,6 +96,51 @@ int main() {
          == ncclSuccess);
   assert(proxyOpHandle != nullptr);
 
+  ncclProfilerEventDescr_t detachedProxyOp = proxyOp;
+  detachedProxyOp.parentObj = reinterpret_cast<void*>(1);
+  detachedProxyOp.proxyOp.pid = getpid() + 1;
+  void* detachedProxyOpHandle = reinterpret_cast<void*>(1);
+  assert(ncclProfiler_v5.startEvent(
+           context, &detachedProxyOpHandle, &detachedProxyOp) == ncclSuccess);
+  assert(detachedProxyOpHandle != nullptr);
+  ncclProfilerEventDescr_t detachedProxyStep;
+  memset(&detachedProxyStep, 0, sizeof(detachedProxyStep));
+  detachedProxyStep.type = ncclProfileProxyStep;
+  detachedProxyStep.parentObj = detachedProxyOpHandle;
+  detachedProxyStep.rank = 0;
+  detachedProxyStep.proxyStep.step = 0;
+  void* detachedProxyStepHandle = nullptr;
+  assert(ncclProfiler_v5.startEvent(
+           context, &detachedProxyStepHandle, &detachedProxyStep) == ncclSuccess);
+  assert(detachedProxyStepHandle != nullptr);
+  ncclProfilerEventStateArgs_t detachedStateArgs;
+  memset(&detachedStateArgs, 0, sizeof(detachedStateArgs));
+  assert(ncclProfiler_v5.recordEventState(
+           detachedProxyStepHandle, ncclProfilerProxyStepSendGPUWait,
+           &detachedStateArgs) == ncclSuccess);
+  assert(ncclProfiler_v5.recordEventState(
+           detachedProxyStepHandle, ncclProfilerProxyStepSendPeerWait_v4,
+           &detachedStateArgs) == ncclSuccess);
+  detachedStateArgs.proxyStep.transSize = 4096;
+  assert(ncclProfiler_v5.recordEventState(
+           detachedProxyStepHandle, ncclProfilerProxyStepSendWait,
+           &detachedStateArgs) == ncclSuccess);
+  assert(ncclProfiler_v5.stopEvent(detachedProxyStepHandle) == ncclSuccess);
+  assert(ncclProfiler_v5.stopEvent(detachedProxyOpHandle) == ncclSuccess);
+
+  // The proxy operation must retain its local collective parent even after
+  // NCCL stops the task event. Force a pool allocation between parent stop
+  // and proxy stop so a missing proxy reference deterministically reuses it.
+  assert(ncclProfiler_v5.stopEvent(collHandle) == ncclSuccess);
+  ncclProfilerEventDescr_t replacementColl = coll;
+  replacementColl.coll.seqNumber = 2;
+  replacementColl.coll.func = "Broadcast";
+  void* replacementCollHandle = nullptr;
+  assert(ncclProfiler_v5.startEvent(
+           context, &replacementCollHandle, &replacementColl) == ncclSuccess);
+  assert(replacementCollHandle != nullptr);
+  assert(replacementCollHandle != collHandle);
+
   ncclProfilerEventDescr_t proxyStep;
   memset(&proxyStep, 0, sizeof(proxyStep));
   proxyStep.type = ncclProfileProxyStep;
@@ -129,7 +174,7 @@ int main() {
   usleep(1000);
   assert(ncclProfiler_v5.stopEvent(proxyStepHandle) == ncclSuccess);
   assert(ncclProfiler_v5.stopEvent(proxyOpHandle) == ncclSuccess);
-  assert(ncclProfiler_v5.stopEvent(collHandle) == ncclSuccess);
+  assert(ncclProfiler_v5.stopEvent(replacementCollHandle) == ncclSuccess);
   assert(ncclInspectorStepEnd(7, 0) == 0);
   assert(ncclProfiler_v5.finalize(context) == ncclSuccess);
 
@@ -142,6 +187,8 @@ int main() {
   assert(output.find("# nccl_inspector_step_proxy_info") != std::string::npos);
   assert(output.find("\"dropped_ops\":0") != std::string::npos);
   assert(output.find("\"dropped_steps\":0") != std::string::npos);
+  assert(output.find("\"detached_ops\":1") != std::string::npos);
+  assert(output.find("\"family\":\"pxn\"") != std::string::npos);
   assert(output.find("\"step\":7") != std::string::npos);
   assert(output.find("\"family\":\"dp\"") != std::string::npos);
   assert(output.find("\"operation\":\"ReduceScatter\"") != std::string::npos);

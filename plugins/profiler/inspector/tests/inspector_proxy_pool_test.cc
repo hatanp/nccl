@@ -4,6 +4,9 @@
 
 int main() {
   assert(inspectorProxyPoolInit(2, 1) == inspectorSuccess);
+  assert(inspectorProxyPoolDetachedOps() == 0);
+  inspectorProxyPoolRecordDetachedOp();
+  assert(inspectorProxyPoolDetachedOps() == 1);
   inspectorProxyOpInfo* first = inspectorProxyPoolAllocOp();
   inspectorProxyOpInfo* second = inspectorProxyPoolAllocOp();
   assert(first != nullptr);

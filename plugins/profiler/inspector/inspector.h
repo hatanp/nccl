@@ -241,6 +241,8 @@ struct inspectorProxyOpInfo {
   uint64_t type;
   struct inspectorCommInfo* commInfo;
   uint64_t parentType;
+  void* parentObj;
+  int detached;
   ncclFunc_t func;
   uint64_t sequence;
   size_t messageSizeBytes;

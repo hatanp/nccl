@@ -374,8 +374,10 @@ inspectorResult_t inspectorPromRecordProxyOp(
     return inspectorSuccess;
   }
   inspectorPromTopologySizes sizes = inspectorPromGetTopologySizes();
-  inspectorPromSemanticFamily family = inspectorPromClassifyFamily(
-    op->parentType == ncclProfileP2p, op->nranks, op->nnodes, sizes);
+  inspectorPromSemanticFamily family = op->detached
+    ? inspectorPromFamilyPxn
+    : inspectorPromClassifyFamily(
+        op->parentType == ncclProfileP2p, op->nranks, op->nnodes, sizes);
   if (family == inspectorPromFamilyUnknown) return inspectorSuccess;
   std::lock_guard<std::mutex> lock(gInspectorPromStreamingMutex);
   inspectorPromDevice& device =
@@ -1259,10 +1261,12 @@ static inspectorResult_t inspectorPromWriteStepProxy(
     buffer, sizeof(buffer),
     "# nccl_inspector_step_proxy_info {\"records\":%zu,"
     "\"dropped_ops\":%" PRIu64 ",\"dropped_steps\":%" PRIu64
+    ",\"detached_ops\":%" PRIu64
     ",\"phase_fields\":[\"send_gpu_wait\",\"send_peer_wait\","
     "\"send_wait\",\"recv_wait\",\"recv_flush_wait\","
     "\"recv_gpu_wait\"]}\n",
-    proxy.size(), inspectorProxyPoolDroppedOps(), inspectorProxyPoolDroppedSteps());
+    proxy.size(), inspectorProxyPoolDroppedOps(), inspectorProxyPoolDroppedSteps(),
+    inspectorProxyPoolDetachedOps());
   if (infoWritten < 0 || (size_t)infoWritten >= sizeof(buffer)) {
     return inspectorMemoryError;
   }

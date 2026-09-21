@@ -21,7 +21,8 @@ enum inspectorPromSemanticFamily {
   inspectorPromFamilyEp,
   inspectorPromFamilyGlobal,
   inspectorPromFamilyPpLocal,
-  inspectorPromFamilyPpCrossNode
+  inspectorPromFamilyPpCrossNode,
+  inspectorPromFamilyPxn
 };
 
 struct inspectorPromTopologySizes {
@@ -65,6 +66,7 @@ static inline const char* inspectorPromSemanticFamilyName(
     case inspectorPromFamilyGlobal: return "global";
     case inspectorPromFamilyPpLocal: return "pp_local";
     case inspectorPromFamilyPpCrossNode: return "pp_cross_node";
+    case inspectorPromFamilyPxn: return "pxn";
     default: return "unknown";
   }
 }
