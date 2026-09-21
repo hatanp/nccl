@@ -122,6 +122,10 @@ int main() {
   assert(ncclProfiler_v5.recordEventState(
            proxyStepHandle, ncclProfilerProxyStepSendWait, &stateArgs)
          == ncclSuccess);
+  stateArgs.proxyStep.transSize = SIZE_MAX;
+  assert(ncclProfiler_v5.recordEventState(
+           proxyStepHandle, ncclProfilerProxyStepSendWait, &stateArgs)
+         == ncclSuccess);
   usleep(1000);
   assert(ncclProfiler_v5.stopEvent(proxyStepHandle) == ncclSuccess);
   assert(ncclProfiler_v5.stopEvent(proxyOpHandle) == ncclSuccess);
@@ -144,6 +148,7 @@ int main() {
   assert(output.find("\"direction\":\"send\"") != std::string::npos);
   assert(output.find("\"count\":1") != std::string::npos);
   assert(output.find("\"transfer_bytes\":4096") != std::string::npos);
+  assert(output.find("\"unknown_transfer_sizes\":1") != std::string::npos);
   assert(output.find("\"missing_transitions\":0") != std::string::npos);
   assert(output.find("\"phase_count\":[1,1,1,0,0,0]") != std::string::npos);
 

@@ -38,6 +38,20 @@ static uint32_t inspectorProxyPoolSize(const char* name, uint32_t defaultValue) 
   return static_cast<uint32_t>(parsed);
 }
 
+static void inspectorProxyStepAddTransferSize(
+    inspectorProxyStepInfo* proxyStep,
+    size_t transferSize) {
+  if (proxyStep == nullptr) return;
+  // NCCL's receive completion size originates as an int and can use -1 as a
+  // sentinel. It reaches the profiler ABI as SIZE_MAX and is not byte data.
+  if (transferSize == SIZE_MAX
+      || transferSize > UINT64_MAX - proxyStep->transferSizeBytes) {
+    proxyStep->unknownTransferSizes++;
+    return;
+  }
+  proxyStep->transferSizeBytes += transferSize;
+}
+
 
 /*
  * Description:
@@ -879,6 +893,7 @@ __hidden ncclResult_t inspectorPluginStopEvent(void *eHandle) {
     if (parent != nullptr) {
       parent->proxyStepCount++;
       parent->transferSizeBytes += proxyStep->transferSizeBytes;
+      parent->unknownTransferSizes += proxyStep->unknownTransferSizes;
       int firstPhase = proxyStep->isSend ? inspectorProxySendGpuWait
                                          : inspectorProxyRecvWait;
       int stopPhase = proxyStep->isSend ? inspectorProxyRecvWait
@@ -946,14 +961,16 @@ __hidden ncclResult_t inspectorPluginRecordEventState(void* eHandle,
       case ncclProfilerProxyStepRecvFlushWait:
         if (proxyStep->stateUsecs[1] == 0) proxyStep->stateUsecs[1] = timestamp;
         if (eState == ncclProfilerProxyStepRecvFlushWait) {
-          proxyStep->transferSizeBytes += eStateArgs->proxyStep.transSize;
+          inspectorProxyStepAddTransferSize(
+            proxyStep, eStateArgs->proxyStep.transSize);
         }
         break;
       case ncclProfilerProxyStepSendWait:
       case ncclProfilerProxyStepRecvGPUWait:
         proxyStep->stateUsecs[2] = timestamp;
         if (eState == ncclProfilerProxyStepSendWait) {
-          proxyStep->transferSizeBytes += eStateArgs->proxyStep.transSize;
+          inspectorProxyStepAddTransferSize(
+            proxyStep, eStateArgs->proxyStep.transSize);
         }
         break;
       default:

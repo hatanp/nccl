@@ -178,6 +178,7 @@ struct inspectorPromStepProxyKey {
 struct inspectorPromStepProxyAgg {
   uint64_t count = 0;
   uint64_t transferBytes = 0;
+  uint64_t unknownTransferSizes = 0;
   uint64_t phaseCount[inspectorProxyWaitPhaseCount] = {0, 0, 0, 0, 0, 0};
   uint64_t phaseSumUsecs[inspectorProxyWaitPhaseCount] = {0, 0, 0, 0, 0, 0};
   uint64_t phaseMaxUsecs[inspectorProxyWaitPhaseCount] = {0, 0, 0, 0, 0, 0};
@@ -386,6 +387,7 @@ inspectorResult_t inspectorPromRecordProxyOp(
   inspectorPromStepProxyAgg& agg = device.stepProxy[key];
   agg.count += op->proxyStepCount;
   agg.transferBytes += op->transferSizeBytes;
+  agg.unknownTransferSizes += op->unknownTransferSizes;
   agg.missingTransitions += op->missingTransitions;
   for (int phase = 0; phase < inspectorProxyWaitPhaseCount; phase++) {
     agg.phaseCount[phase] += op->phaseCount[phase];
@@ -1276,6 +1278,7 @@ static inspectorResult_t inspectorPromWriteStepProxy(
       ",\"family\":\"%s\",\"operation\":\"%s\""
       ",\"message_size_bytes\":%zu,\"direction\":\"%s\""
       ",\"count\":%" PRIu64 ",\"transfer_bytes\":%" PRIu64
+      ",\"unknown_transfer_sizes\":%" PRIu64
       ",\"missing_transitions\":%" PRIu64
       ",\"phase_count\":[%" PRIu64 ",%" PRIu64 ",%" PRIu64
       ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 "]"
@@ -1286,7 +1289,7 @@ static inspectorResult_t inspectorPromWriteStepProxy(
       key.step, inspectorPromSemanticFamilyName(key.family),
       ncclFuncToString(key.func), key.messageSizeBytes,
       key.isSend ? "send" : "recv", agg.count, agg.transferBytes,
-      agg.missingTransitions,
+      agg.unknownTransferSizes, agg.missingTransitions,
       agg.phaseCount[0], agg.phaseCount[1], agg.phaseCount[2],
       agg.phaseCount[3], agg.phaseCount[4], agg.phaseCount[5],
       agg.phaseSumUsecs[0], agg.phaseSumUsecs[1], agg.phaseSumUsecs[2],

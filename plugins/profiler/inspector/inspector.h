@@ -255,6 +255,7 @@ struct inspectorProxyOpInfo {
   char proto[NCCL_INSPECTOR_PROTO_NAME_MAX];
   uint64_t proxyStepCount;
   uint64_t transferSizeBytes;
+  uint64_t unknownTransferSizes;
   uint64_t phaseCount[inspectorProxyWaitPhaseCount];
   uint64_t phaseSumUsecs[inspectorProxyWaitPhaseCount];
   uint64_t phaseMaxUsecs[inspectorProxyWaitPhaseCount];
@@ -271,6 +272,7 @@ struct inspectorProxyStepInfo {
   uint64_t stopUsecs;
   uint64_t stateUsecs[3];
   size_t transferSizeBytes;
+  uint64_t unknownTransferSizes;
 };
 
 struct inspectorCollInfo {
