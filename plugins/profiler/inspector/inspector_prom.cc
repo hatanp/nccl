@@ -163,6 +163,11 @@ struct inspectorPromStepProxyKey {
   ncclFunc_t func;
   size_t messageSizeBytes;
   bool isSend;
+  std::string commId;
+  std::string commName;
+  int commRank;
+  int nranks;
+  int nnodes;
 
   bool operator<(const inspectorPromStepProxyKey& other) const {
     if (step != other.step) return step < other.step;
@@ -171,7 +176,12 @@ struct inspectorPromStepProxyKey {
     if (messageSizeBytes != other.messageSizeBytes) {
       return messageSizeBytes < other.messageSizeBytes;
     }
-    return isSend < other.isSend;
+    if (isSend != other.isSend) return isSend < other.isSend;
+    if (commId != other.commId) return commId < other.commId;
+    if (commName != other.commName) return commName < other.commName;
+    if (commRank != other.commRank) return commRank < other.commRank;
+    if (nranks != other.nranks) return nranks < other.nranks;
+    return nnodes < other.nnodes;
   }
 };
 
@@ -382,8 +392,15 @@ inspectorResult_t inspectorPromRecordProxyOp(
         op->parentType == ncclProfileP2p, op->nranks, op->nnodes, sizes);
   if (family == inspectorPromFamilyUnknown) return inspectorSuccess;
   std::lock_guard<std::mutex> lock(gInspectorPromStreamingMutex);
+  const bool hasComm = !op->detached && op->commInfo != nullptr;
   inspectorPromStepProxyKey key {
-    op->applicationStep, family, op->func, op->messageSizeBytes, op->isSend != 0
+    op->applicationStep, family, op->func, op->messageSizeBytes, op->isSend != 0,
+    hasComm ? op->commInfo->commHashStr : "unknown",
+    hasComm && op->commInfo->commName && op->commInfo->commName[0]
+      ? op->commInfo->commName : "unknown",
+    hasComm ? op->commInfo->rank : -1,
+    op->nranks,
+    op->nnodes
   };
   inspectorPromStepProxyAgg* aggPtr = nullptr;
   inspectorPromDevice* devicePtr = nullptr;
@@ -1295,6 +1312,8 @@ static inspectorResult_t inspectorPromWriteStepProxy(
       "# nccl_inspector_step_proxy {\"step\":%" PRId64
       ",\"family\":\"%s\",\"operation\":\"%s\""
       ",\"message_size_bytes\":%zu,\"direction\":\"%s\""
+      ",\"comm_id\":\"%s\",\"comm_name\":\"%s\""
+      ",\"comm_rank\":%d,\"nranks\":%d,\"n_nodes\":%d"
       ",\"count\":%" PRIu64 ",\"transfer_bytes\":%" PRIu64
       ",\"unknown_transfer_sizes\":%" PRIu64
       ",\"missing_transitions\":%" PRIu64
@@ -1306,7 +1325,8 @@ static inspectorResult_t inspectorPromWriteStepProxy(
       ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 "]}\n",
       key.step, inspectorPromSemanticFamilyName(key.family),
       ncclFuncToString(key.func), key.messageSizeBytes,
-      key.isSend ? "send" : "recv", agg.count, agg.transferBytes,
+      key.isSend ? "send" : "recv", key.commId.c_str(), key.commName.c_str(),
+      key.commRank, key.nranks, key.nnodes, agg.count, agg.transferBytes,
       agg.unknownTransferSizes, agg.missingTransitions,
       agg.phaseCount[0], agg.phaseCount[1], agg.phaseCount[2],
       agg.phaseCount[3], agg.phaseCount[4], agg.phaseCount[5],

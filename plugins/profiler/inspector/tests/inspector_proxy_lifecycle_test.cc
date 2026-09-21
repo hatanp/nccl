@@ -193,6 +193,11 @@ int main() {
   assert(output.find("\"family\":\"dp\"") != std::string::npos);
   assert(output.find("\"operation\":\"ReduceScatter\"") != std::string::npos);
   assert(output.find("\"direction\":\"send\"") != std::string::npos);
+  assert(output.find("\"comm_id\":\"00000000000004d2\"") != std::string::npos);
+  assert(output.find("\"comm_name\":\"test\"") != std::string::npos);
+  assert(output.find("\"comm_rank\":0") != std::string::npos);
+  assert(output.find("\"nranks\":64") != std::string::npos);
+  assert(output.find("\"n_nodes\":2") != std::string::npos);
   assert(output.find("\"count\":1") != std::string::npos);
   assert(output.find("\"transfer_bytes\":4096") != std::string::npos);
   assert(output.find("\"unknown_transfer_sizes\":1") != std::string::npos);
