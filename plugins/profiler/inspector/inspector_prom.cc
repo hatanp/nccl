@@ -215,7 +215,7 @@ struct inspectorPromDevice {
   uint64_t p2pOverwritten = 0;
   bool hasData = false;
 };
-static const int kInspectorPromFormatMinor = 5;
+static const int kInspectorPromFormatMinor = 6;
 static const size_t kInspectorPromPercentileSampleCapacity = 256;
 static const size_t kInspectorPromGlobalSlowEventCapacity = 4;
 static std::mutex gInspectorPromStreamingMutex;
@@ -390,7 +390,6 @@ inspectorResult_t inspectorPromRecordProxyOp(
     ? inspectorPromFamilyPxn
     : inspectorPromClassifyFamily(
         op->parentType == ncclProfileP2p, op->nranks, op->nnodes, sizes);
-  if (family == inspectorPromFamilyUnknown) return inspectorSuccess;
   std::lock_guard<std::mutex> lock(gInspectorPromStreamingMutex);
   const bool hasComm = !op->detached && op->commInfo != nullptr;
   inspectorPromStepProxyKey key {
@@ -1288,16 +1287,20 @@ static inspectorResult_t inspectorPromWriteStepProxy(
                    inspectorPromStepProxyAgg>& proxy) {
   if (!file) return inspectorFileOpenError;
   char buffer[3072];
+  inspectorPromTopologySizes sizes = inspectorPromGetTopologySizes();
   int infoWritten = snprintf(
     buffer, sizeof(buffer),
     "# nccl_inspector_step_proxy_info {\"records\":%zu,"
     "\"dropped_ops\":%" PRIu64 ",\"dropped_steps\":%" PRIu64
     ",\"detached_ops\":%" PRIu64
+    ",\"world_size\":%d,\"dp_size\":%d,\"edp_size\":%d"
+    ",\"ep_size\":%d,\"pp_size\":%d"
     ",\"phase_fields\":[\"send_gpu_wait\",\"send_peer_wait\","
     "\"send_wait\",\"recv_wait\",\"recv_flush_wait\","
     "\"recv_gpu_wait\"]}\n",
     proxy.size(), inspectorProxyPoolDroppedOps(), inspectorProxyPoolDroppedSteps(),
-    inspectorProxyPoolDetachedOps());
+    inspectorProxyPoolDetachedOps(), sizes.world, sizes.dp, sizes.edp,
+    sizes.ep, sizes.pp);
   if (infoWritten < 0 || (size_t)infoWritten >= sizeof(buffer)) {
     return inspectorMemoryError;
   }

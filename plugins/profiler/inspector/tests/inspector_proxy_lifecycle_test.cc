@@ -188,6 +188,11 @@ int main() {
   assert(output.find("\"dropped_ops\":0") != std::string::npos);
   assert(output.find("\"dropped_steps\":0") != std::string::npos);
   assert(output.find("\"detached_ops\":1") != std::string::npos);
+  assert(output.find("\"world_size\":256") != std::string::npos);
+  assert(output.find("\"dp_size\":64") != std::string::npos);
+  assert(output.find("\"edp_size\":2") != std::string::npos);
+  assert(output.find("\"ep_size\":32") != std::string::npos);
+  assert(output.find("\"pp_size\":4") != std::string::npos);
   assert(output.find("\"family\":\"pxn\"") != std::string::npos);
   assert(output.find("\"step\":7") != std::string::npos);
   assert(output.find("\"family\":\"dp\"") != std::string::npos);
