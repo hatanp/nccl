@@ -67,6 +67,7 @@ SRCS := inspector.cc \
 	inspector_cudawrap.cc \
 	inspector_ring.cc \
 	inspector_event_pool.cc \
+	inspector_proxy_pool.cc \
 	json.cc \
 	version.cc
 
@@ -76,7 +77,7 @@ OBJS := $(SRCS:%.cc=$(OBJDIR)/%.o)
 TARGET := libnccl-profiler-inspector.so
 
 # Build rules
-.PHONY: all clean help check-cuda test-ring test-prom-stats
+.PHONY: all clean help check-cuda test-ring test-prom-stats test-proxy-stats test-proxy-pool
 
 all: check-cuda $(TARGET)
 
@@ -91,6 +92,18 @@ test-prom-stats:
 		tests/inspector_prom_stats_test.cc -o inspector_prom_stats_test
 	./inspector_prom_stats_test
 	rm -f inspector_prom_stats_test
+
+test-proxy-stats:
+	$(CXX) $(CXXSTD) -Wall -Wextra $(INCLUDES) \
+		tests/inspector_proxy_stats_test.cc -o inspector_proxy_stats_test
+	./inspector_proxy_stats_test
+	rm -f inspector_proxy_stats_test
+
+test-proxy-pool:
+	$(CXX) $(CXXSTD) -Wall -Wextra $(INCLUDES) \
+		tests/inspector_proxy_pool_test.cc inspector_proxy_pool.cc -o inspector_proxy_pool_test
+	./inspector_proxy_pool_test
+	rm -f inspector_proxy_pool_test
 
 # Check that CUDA installation exists
 check-cuda:

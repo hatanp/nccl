@@ -6,6 +6,7 @@
  *************************************************************************/
 
 #include <stdio.h>
+#include <algorithm>
 #include <pthread.h>
 #include <string.h>
 #include <linux/limits.h>
@@ -18,12 +19,24 @@
 #include "inspector_prom.h"
 #include "inspector_ring.h"
 #include "inspector_event_pool.h"
+#include "inspector_proxy_pool.h"
 
 #define __hidden __attribute__ ((visibility("hidden")))
 
 static int gInitialized;
 
 static pthread_mutex_t gLock = PTHREAD_MUTEX_INITIALIZER;
+
+static uint32_t inspectorProxyPoolSize(const char* name, uint32_t defaultValue) {
+  const char* value = getenv(name);
+  if (value == nullptr || value[0] == '\0') return defaultValue;
+  char* end = nullptr;
+  unsigned long parsed = strtoul(value, &end, 10);
+  if (end == value || *end != '\0' || parsed == 0 || parsed > UINT32_MAX) {
+    return defaultValue;
+  }
+  return static_cast<uint32_t>(parsed);
+}
 
 
 /*
@@ -119,6 +132,16 @@ __hidden ncclResult_t inspectorPluginInit(void** context, uint64_t commHash,
       pthread_mutex_unlock(&gLock);
       return ncclSuccess;
     }
+    if (enableNcclInspectorProxyStep) {
+      inspectorResult_t proxyResult = inspectorProxyPoolInit(
+        inspectorProxyPoolSize("NCCL_INSPECTOR_PROXY_OP_POOL_SIZE", 8192),
+        inspectorProxyPoolSize("NCCL_INSPECTOR_PROXY_STEP_POOL_SIZE", 32768));
+      if (proxyResult != inspectorSuccess) {
+        enableNcclInspectorProxyStep = false;
+        WARN_INSPECTOR(
+          "Inspector: failed to initialize fixed proxy pools; disabling proxy tracking");
+      }
+    }
   }
   pthread_mutex_unlock(&gLock);
 
@@ -133,6 +156,9 @@ __hidden ncclResult_t inspectorPluginInit(void** context, uint64_t commHash,
   *eActivationMask = ncclProfileColl | ncclProfileKernelCh;
   if (enableNcclInspectorP2p) {
     *eActivationMask |= ncclProfileP2p;
+  }
+  if (enableNcclInspectorProxyStep) {
+    *eActivationMask |= ncclProfileProxyOp | ncclProfileProxyStep;
   }
 
   INFO(NCCL_INIT, "PROFILER/Plugin: init commName: %s commHash: %lu nranks: %d rank: %d",
@@ -164,6 +190,7 @@ __hidden ncclResult_t inspectorPluginFinalize(void* context) {
   pthread_mutex_lock(&gLock);
   if (--gInitialized == 0) {
     inspectorGlobalFinalize();
+    inspectorProxyPoolFinalize();
   }
   pthread_mutex_unlock(&gLock);
   return ncclSuccess;
@@ -432,6 +459,65 @@ static void inspectorPluginKernelChInfoInit(struct inspectorKernelChInfo **kerne
   }
 }
 
+static void inspectorPluginProxyOpInfoInit(
+    struct inspectorProxyOpInfo** proxyOp,
+    ncclProfilerEventDescr_t* eDescr,
+    struct inspectorCommInfo* commInfo) {
+  *proxyOp = nullptr;
+  if (!enableNcclInspectorProxyStep || eDescr->parentObj == nullptr) return;
+  int64_t applicationStep = inspectorPromCurrentStep();
+  if (applicationStep < 0) return;
+  uint64_t parentType = *static_cast<uint64_t*>(eDescr->parentObj);
+  if (parentType != ncclProfileColl && parentType != ncclProfileP2p) return;
+  inspectorProxyOpInfo* event = inspectorProxyPoolAllocOp();
+  if (event == nullptr) return;
+  event->type = ncclProfileProxyOp;
+  event->commInfo = commInfo;
+  event->parentType = parentType;
+  event->rank = eDescr->rank;
+  event->nranks = commInfo->nranks;
+  event->nnodes = commInfo->nnodes;
+  event->channelId = eDescr->proxyOp.channelId;
+  event->peer = eDescr->proxyOp.peer;
+  event->isSend = eDescr->proxyOp.isSend;
+  event->applicationStep = applicationStep;
+  if (parentType == ncclProfileColl) {
+    inspectorCollInfo* parent = static_cast<inspectorCollInfo*>(eDescr->parentObj);
+    event->func = ncclStringToFunc(parent->func);
+    event->sequence = parent->sn;
+    event->messageSizeBytes = parent->msgSizeBytes;
+    snprintf(event->algo, sizeof(event->algo), "%s",
+             parent->algo ? parent->algo : "unknown");
+    snprintf(event->proto, sizeof(event->proto), "%s",
+             parent->proto ? parent->proto : "unknown");
+  } else {
+    inspectorP2pInfo* parent = static_cast<inspectorP2pInfo*>(eDescr->parentObj);
+    event->func = ncclStringToFunc(parent->func);
+    event->sequence = parent->sn;
+    event->messageSizeBytes = parent->msgSizeBytes;
+  }
+  *proxyOp = event;
+}
+
+static void inspectorPluginProxyStepInfoInit(
+    struct inspectorProxyStepInfo** proxyStep,
+    ncclProfilerEventDescr_t* eDescr) {
+  *proxyStep = nullptr;
+  if (!enableNcclInspectorProxyStep || eDescr->parentObj == nullptr) return;
+  inspectorProxyOpInfo* parent =
+    static_cast<inspectorProxyOpInfo*>(eDescr->parentObj);
+  if (parent->type != ncclProfileProxyOp || parent->applicationStep < 0) return;
+  inspectorProxyStepInfo* event = inspectorProxyPoolAllocStep();
+  if (event == nullptr) return;
+  event->type = ncclProfileProxyStep;
+  event->parent = parent;
+  event->transferStep = eDescr->proxyStep.step;
+  event->applicationStep = parent->applicationStep;
+  event->isSend = parent->isSend != 0;
+  event->startUsecs = inspectorGetTime();
+  *proxyStep = event;
+}
+
 static bool inspectorShouldTrackColl(const ncclProfilerEventDescr_t* eDescr) {
   if (!eDescr) {
     return false;
@@ -513,6 +599,15 @@ __hidden ncclResult_t inspectorPluginStartEvent(void* context,
     struct inspectorKernelChInfo *kernelChEvent = nullptr;
     inspectorPluginKernelChInfoInit(&kernelChEvent, eDescr);
     *eHandle = kernelChEvent;
+  } else if (eDescr->type == ncclProfileProxyOp) {
+    struct inspectorProxyOpInfo* proxyOp = nullptr;
+    inspectorPluginProxyOpInfoInit(
+      &proxyOp, eDescr, static_cast<inspectorCommInfo*>(context));
+    *eHandle = proxyOp;
+  } else if (eDescr->type == ncclProfileProxyStep) {
+    struct inspectorProxyStepInfo* proxyStep = nullptr;
+    inspectorPluginProxyStepInfoInit(&proxyStep, eDescr);
+    *eHandle = proxyStep;
   } else {
     return ncclSuccess;
   }
@@ -767,6 +862,43 @@ __hidden ncclResult_t inspectorPluginStopEvent(void *eHandle) {
     struct inspectorKernelChInfo *kernelChInfo
       = (struct inspectorKernelChInfo *)eHandle;
     return inspectorPluginStopEventKernelCh(kernelChInfo);
+  } else if (type == ncclProfileProxyStep) {
+    struct inspectorProxyStepInfo* proxyStep =
+      static_cast<inspectorProxyStepInfo*>(eHandle);
+    proxyStep->stopUsecs = inspectorGetTime();
+    inspectorProxyStepTimeline timeline;
+    timeline.isSend = proxyStep->isSend;
+    timeline.startUsecs = proxyStep->startUsecs;
+    timeline.stopUsecs = proxyStep->stopUsecs;
+    for (int index = 0; index < 3; index++) {
+      timeline.states[index] = proxyStep->stateUsecs[index];
+    }
+    inspectorProxyWaitDurations durations =
+      inspectorProxyComputeWaitDurations(timeline);
+    inspectorProxyOpInfo* parent = proxyStep->parent;
+    if (parent != nullptr) {
+      parent->proxyStepCount++;
+      parent->transferSizeBytes += proxyStep->transferSizeBytes;
+      int firstPhase = proxyStep->isSend ? inspectorProxySendGpuWait
+                                         : inspectorProxyRecvWait;
+      int stopPhase = proxyStep->isSend ? inspectorProxyRecvWait
+                                        : inspectorProxyWaitPhaseCount;
+      for (int phase = firstPhase; phase < stopPhase; phase++) {
+        if (durations.validMask & (1u << phase)) {
+          parent->phaseCount[phase]++;
+          parent->phaseSumUsecs[phase] += durations.usecs[phase];
+          parent->phaseMaxUsecs[phase] = std::max(
+            parent->phaseMaxUsecs[phase], durations.usecs[phase]);
+        } else {
+          parent->missingTransitions++;
+        }
+      }
+    }
+    inspectorProxyPoolReleaseStep(proxyStep);
+  } else if (type == ncclProfileProxyOp) {
+    inspectorProxyOpInfo* proxyOp = static_cast<inspectorProxyOpInfo*>(eHandle);
+    inspectorPromRecordProxyOp(proxyOp);
+    inspectorProxyPoolReleaseOp(proxyOp);
   }
   return ncclSuccess;
 }
@@ -800,6 +932,35 @@ __hidden ncclResult_t inspectorPluginRecordEventState(void* eHandle,
     return ncclSuccess;
 
   uint64_t type = *(uint64_t *)eHandle;
+
+  if (type == ncclProfileProxyStep) {
+    struct inspectorProxyStepInfo* proxyStep =
+      static_cast<inspectorProxyStepInfo*>(eHandle);
+    uint64_t timestamp = inspectorGetTime();
+    switch (eState) {
+      case ncclProfilerProxyStepSendGPUWait:
+      case ncclProfilerProxyStepRecvWait:
+        proxyStep->stateUsecs[0] = timestamp;
+        break;
+      case ncclProfilerProxyStepSendPeerWait_v4:
+      case ncclProfilerProxyStepRecvFlushWait:
+        if (proxyStep->stateUsecs[1] == 0) proxyStep->stateUsecs[1] = timestamp;
+        if (eState == ncclProfilerProxyStepRecvFlushWait) {
+          proxyStep->transferSizeBytes += eStateArgs->proxyStep.transSize;
+        }
+        break;
+      case ncclProfilerProxyStepSendWait:
+      case ncclProfilerProxyStepRecvGPUWait:
+        proxyStep->stateUsecs[2] = timestamp;
+        if (eState == ncclProfilerProxyStepSendWait) {
+          proxyStep->transferSizeBytes += eStateArgs->proxyStep.transSize;
+        }
+        break;
+      default:
+        break;
+    }
+    return ncclSuccess;
+  }
 
   if (type == ncclProfileKernelCh && eState == ncclProfilerKernelChStop) {
 

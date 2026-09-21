@@ -9,6 +9,8 @@
 #include "inspector.h"
 #include "inspector_cudawrap.h"
 #include "inspector_prom_stats.h"
+#include "inspector_proxy_pool.h"
+#include "inspector_proxy_stats.h"
 #include "inspector_ring.h"
 
 #include <stdio.h>
@@ -16,6 +18,7 @@
 #include <string.h>
 #include <inttypes.h>
 #include <algorithm>
+#include <atomic>
 #include <map>
 #include <limits>
 #include <mutex>
@@ -153,6 +156,33 @@ struct inspectorPromStepP2pEvent {
   inspectorTimingSource_t timingSource;
 };
 
+struct inspectorPromStepProxyKey {
+  int64_t step;
+  inspectorPromSemanticFamily family;
+  ncclFunc_t func;
+  size_t messageSizeBytes;
+  bool isSend;
+
+  bool operator<(const inspectorPromStepProxyKey& other) const {
+    if (step != other.step) return step < other.step;
+    if (family != other.family) return family < other.family;
+    if (func != other.func) return func < other.func;
+    if (messageSizeBytes != other.messageSizeBytes) {
+      return messageSizeBytes < other.messageSizeBytes;
+    }
+    return isSend < other.isSend;
+  }
+};
+
+struct inspectorPromStepProxyAgg {
+  uint64_t count = 0;
+  uint64_t transferBytes = 0;
+  uint64_t phaseCount[inspectorProxyWaitPhaseCount] = {0, 0, 0, 0, 0, 0};
+  uint64_t phaseSumUsecs[inspectorProxyWaitPhaseCount] = {0, 0, 0, 0, 0, 0};
+  uint64_t phaseMaxUsecs[inspectorProxyWaitPhaseCount] = {0, 0, 0, 0, 0, 0};
+  uint64_t missingTransitions = 0;
+};
+
 using inspectorPromCollBucketMap = std::map<inspectorPromCollBucketKey, inspectorPromBucketAgg>;
 using inspectorPromP2pBucketMap = std::map<inspectorPromP2pBucketKey, inspectorPromBucketAgg>;
 
@@ -168,6 +198,7 @@ struct inspectorPromDevice {
   std::map<inspectorPromStepFamilyKey, inspectorPromStepFamilyAgg> stepFamilies;
   std::map<int64_t, std::vector<inspectorPromStepP2pEvent>> stepP2pEvents;
   std::map<int64_t, uint64_t> stepP2pDropped;
+  std::map<inspectorPromStepProxyKey, inspectorPromStepProxyAgg> stepProxy;
   uint64_t collOverwritten = 0;
   uint64_t p2pOverwritten = 0;
   bool hasData = false;
@@ -177,8 +208,11 @@ static const size_t kInspectorPromPercentileSampleCapacity = 256;
 static const size_t kInspectorPromGlobalSlowEventCapacity = 4;
 static std::mutex gInspectorPromStreamingMutex;
 static std::map<std::string, inspectorPromDevice> gInspectorPromStreamingDevices;
-static int64_t gInspectorPromCurrentStep = -1;
+static std::atomic<int64_t> gInspectorPromCurrentStep {-1};
 static std::set<int64_t> gInspectorPromRetainedSteps;
+
+static void inspectorPromInitDevice(inspectorPromDevice& device,
+                                    const inspectorCommInfo* commInfo);
 
 static bool inspectorPromStepEnabled() {
   static const bool enabled = []() {
@@ -262,11 +296,11 @@ int ncclInspectorStepBegin(int64_t step, uint64_t wallTimeNs) {
   std::lock_guard<std::mutex> lock(gInspectorPromStreamingMutex);
   if (gInspectorPromRetainedSteps.count(step) == 0
       && gInspectorPromRetainedSteps.size() >= inspectorPromStepCapacity()) {
-    gInspectorPromCurrentStep = -1;
+    gInspectorPromCurrentStep.store(-1, std::memory_order_relaxed);
     return 0;
   }
   gInspectorPromRetainedSteps.insert(step);
-  gInspectorPromCurrentStep = step;
+  gInspectorPromCurrentStep.store(step, std::memory_order_relaxed);
   return 0;
 }
 
@@ -275,8 +309,8 @@ int ncclInspectorStepEnd(int64_t step, uint64_t wallTimeNs) {
   (void)wallTimeNs;
   if (!inspectorPromStepEnabled()) return 0;
   std::lock_guard<std::mutex> lock(gInspectorPromStreamingMutex);
-  if (gInspectorPromCurrentStep == step) {
-    gInspectorPromCurrentStep = -1;
+  if (gInspectorPromCurrentStep.load(std::memory_order_relaxed) == step) {
+    gInspectorPromCurrentStep.store(-1, std::memory_order_relaxed);
   }
   return 0;
 }
@@ -284,12 +318,13 @@ int ncclInspectorStepEnd(int64_t step, uint64_t wallTimeNs) {
 static void inspectorPromStepUpdate(inspectorPromDevice& device,
                                     const inspectorCommInfo* commInfo,
                                     const inspectorCompletedOpInfo& op) {
-  if (!inspectorPromStepEnabled() || gInspectorPromCurrentStep < 0) return;
+  int64_t currentStep = gInspectorPromCurrentStep.load(std::memory_order_relaxed);
+  if (!inspectorPromStepEnabled() || currentStep < 0) return;
   inspectorPromTopologySizes sizes = inspectorPromGetTopologySizes();
   inspectorPromSemanticFamily family = inspectorPromClassifyFamily(
     op.isP2p, commInfo->nranks, commInfo->nnodes, sizes);
   if (family == inspectorPromFamilyUnknown) return;
-  inspectorPromStepFamilyKey key {gInspectorPromCurrentStep, family, op.func};
+  inspectorPromStepFamilyKey key {currentStep, family, op.func};
   inspectorPromStepFamilyAgg& agg = device.stepFamilies[key];
   uint64_t operationStartUsecs;
   uint64_t operationStopUsecs;
@@ -304,7 +339,7 @@ static void inspectorPromStepUpdate(inspectorPromDevice& device,
     agg.lastStopTimestampUsecs, operationStopUsecs);
   if (op.isP2p && family == inspectorPromFamilyPpCrossNode) {
     std::vector<inspectorPromStepP2pEvent>& events
-      = device.stepP2pEvents[gInspectorPromCurrentStep];
+      = device.stepP2pEvents[currentStep];
     if (events.size() < inspectorPromStepP2pCapacity()) {
       events.push_back(inspectorPromStepP2pEvent {
         op.func,
@@ -321,9 +356,44 @@ static void inspectorPromStepUpdate(inspectorPromDevice& device,
         op.timingSource
       });
     } else {
-      device.stepP2pDropped[gInspectorPromCurrentStep]++;
+      device.stepP2pDropped[currentStep]++;
     }
   }
+}
+
+int64_t inspectorPromCurrentStep() {
+  if (!inspectorPromStepEnabled()) return -1;
+  return gInspectorPromCurrentStep.load(std::memory_order_relaxed);
+}
+
+inspectorResult_t inspectorPromRecordProxyOp(
+    const inspectorProxyOpInfo* op) {
+  if (op == nullptr || op->commInfo == nullptr || op->applicationStep < 0) {
+    return inspectorSuccess;
+  }
+  inspectorPromTopologySizes sizes = inspectorPromGetTopologySizes();
+  inspectorPromSemanticFamily family = inspectorPromClassifyFamily(
+    op->parentType == ncclProfileP2p, op->nranks, op->nnodes, sizes);
+  if (family == inspectorPromFamilyUnknown) return inspectorSuccess;
+  std::lock_guard<std::mutex> lock(gInspectorPromStreamingMutex);
+  inspectorPromDevice& device =
+    gInspectorPromStreamingDevices[op->commInfo->deviceUuidStr];
+  inspectorPromInitDevice(device, op->commInfo);
+  inspectorPromStepProxyKey key {
+    op->applicationStep, family, op->func, op->messageSizeBytes, op->isSend != 0
+  };
+  inspectorPromStepProxyAgg& agg = device.stepProxy[key];
+  agg.count += op->proxyStepCount;
+  agg.transferBytes += op->transferSizeBytes;
+  agg.missingTransitions += op->missingTransitions;
+  for (int phase = 0; phase < inspectorProxyWaitPhaseCount; phase++) {
+    agg.phaseCount[phase] += op->phaseCount[phase];
+    agg.phaseSumUsecs[phase] += op->phaseSumUsecs[phase];
+    agg.phaseMaxUsecs[phase] = std::max(
+      agg.phaseMaxUsecs[phase], op->phaseMaxUsecs[phase]);
+  }
+  device.hasData = true;
+  return inspectorSuccess;
 }
 
 static void inspectorPromAggUpdate(inspectorPromBucketAgg& agg,
@@ -1176,6 +1246,62 @@ static inspectorResult_t inspectorPromWriteStepFamilies(
   return inspectorSuccess;
 }
 
+static inspectorResult_t inspectorPromWriteStepProxy(
+    FILE* file,
+    const std::map<inspectorPromStepProxyKey,
+                   inspectorPromStepProxyAgg>& proxy) {
+  if (!file) return inspectorFileOpenError;
+  char buffer[3072];
+  int infoWritten = snprintf(
+    buffer, sizeof(buffer),
+    "# nccl_inspector_step_proxy_info {\"records\":%zu,"
+    "\"dropped_ops\":%" PRIu64 ",\"dropped_steps\":%" PRIu64
+    ",\"phase_fields\":[\"send_gpu_wait\",\"send_peer_wait\","
+    "\"send_wait\",\"recv_wait\",\"recv_flush_wait\","
+    "\"recv_gpu_wait\"]}\n",
+    proxy.size(), inspectorProxyPoolDroppedOps(), inspectorProxyPoolDroppedSteps());
+  if (infoWritten < 0 || (size_t)infoWritten >= sizeof(buffer)) {
+    return inspectorMemoryError;
+  }
+  if (fwrite(buffer, 1, infoWritten, file) != (size_t)infoWritten) {
+    return inspectorFileOpenError;
+  }
+  for (const auto& entry : proxy) {
+    const inspectorPromStepProxyKey& key = entry.first;
+    const inspectorPromStepProxyAgg& agg = entry.second;
+    int written = snprintf(
+      buffer, sizeof(buffer),
+      "# nccl_inspector_step_proxy {\"step\":%" PRId64
+      ",\"family\":\"%s\",\"operation\":\"%s\""
+      ",\"message_size_bytes\":%zu,\"direction\":\"%s\""
+      ",\"count\":%" PRIu64 ",\"transfer_bytes\":%" PRIu64
+      ",\"missing_transitions\":%" PRIu64
+      ",\"phase_count\":[%" PRIu64 ",%" PRIu64 ",%" PRIu64
+      ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 "]"
+      ",\"phase_sum_us\":[%" PRIu64 ",%" PRIu64 ",%" PRIu64
+      ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 "]"
+      ",\"phase_max_us\":[%" PRIu64 ",%" PRIu64 ",%" PRIu64
+      ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 "]}\n",
+      key.step, inspectorPromSemanticFamilyName(key.family),
+      ncclFuncToString(key.func), key.messageSizeBytes,
+      key.isSend ? "send" : "recv", agg.count, agg.transferBytes,
+      agg.missingTransitions,
+      agg.phaseCount[0], agg.phaseCount[1], agg.phaseCount[2],
+      agg.phaseCount[3], agg.phaseCount[4], agg.phaseCount[5],
+      agg.phaseSumUsecs[0], agg.phaseSumUsecs[1], agg.phaseSumUsecs[2],
+      agg.phaseSumUsecs[3], agg.phaseSumUsecs[4], agg.phaseSumUsecs[5],
+      agg.phaseMaxUsecs[0], agg.phaseMaxUsecs[1], agg.phaseMaxUsecs[2],
+      agg.phaseMaxUsecs[3], agg.phaseMaxUsecs[4], agg.phaseMaxUsecs[5]);
+    if (written < 0 || (size_t)written >= sizeof(buffer)) {
+      return inspectorMemoryError;
+    }
+    if (fwrite(buffer, 1, written, file) != (size_t)written) {
+      return inspectorFileOpenError;
+    }
+  }
+  return inspectorSuccess;
+}
+
 static inspectorResult_t inspectorPromWriteStepP2pEvents(
     FILE* file,
     const std::map<int64_t, std::vector<inspectorPromStepP2pEvent>>& byStep,
@@ -1581,6 +1707,7 @@ static inspectorResult_t inspectorPromWriteDeviceBuckets(std::map<std::string,
       file, "nccl_p2p_slow_event_exec_time_microseconds",
       device.p2pSlowest));
     INS_CHK(inspectorPromWriteStepFamilies(file, device.stepFamilies));
+    INS_CHK(inspectorPromWriteStepProxy(file, device.stepProxy));
     INS_CHK(inspectorPromWriteStepP2pEvents(
       file, device.stepP2pEvents, device.stepP2pDropped));
   }

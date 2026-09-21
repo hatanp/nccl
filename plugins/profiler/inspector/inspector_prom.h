@@ -10,6 +10,7 @@
 
 #include <stdio.h>
 #include "inspector.h"
+#include "inspector_proxy_stats.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -29,6 +30,9 @@ struct inspectorDumpThread;
 bool inspectorPromStreamingEnabled();
 inspectorResult_t inspectorPromRecordCompleted(struct inspectorCommInfo* commInfo,
                                                const struct inspectorCompletedOpInfo* op);
+int64_t inspectorPromCurrentStep();
+inspectorResult_t inspectorPromRecordProxyOp(
+  const struct inspectorProxyOpInfo* op);
 
 // Prometheus-related function declarations
 inspectorResult_t inspectorPromCommInfoListDump(struct inspectorCommInfoList* commList,

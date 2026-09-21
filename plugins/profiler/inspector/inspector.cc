@@ -63,6 +63,7 @@ static int64_t ncclInspectorDumpIntervalUsecs = -1;
 static bool ncclInspectorInit = false;
 // Global flag to control P2P tracking
 bool enableNcclInspectorP2p = true;
+bool enableNcclInspectorProxyStep = false;
 
 bool inspectorPromStreamingEnabled() {
   return enableNcclInspectorPromDump && retainNcclInspectorPromDump
@@ -839,6 +840,9 @@ static void showInspectorEnvVars() {
   } envVars[] = {
     {"NCCL_INSPECTOR_ENABLE", getenv("NCCL_INSPECTOR_ENABLE"), "0", "Enable/disable inspector plugin"},
     {"NCCL_INSPECTOR_ENABLE_P2P", getenv("NCCL_INSPECTOR_ENABLE_P2P"), "1", "Enable/disable P2P tracking"},
+    {"NCCL_INSPECTOR_PROXY_STEP_ENABLE", getenv("NCCL_INSPECTOR_PROXY_STEP_ENABLE"), "0", "Enable bounded proxy operation/step wait-state tracking"},
+    {"NCCL_INSPECTOR_PROXY_OP_POOL_SIZE", getenv("NCCL_INSPECTOR_PROXY_OP_POOL_SIZE"), "8192", "Fixed proxy operation pool capacity"},
+    {"NCCL_INSPECTOR_PROXY_STEP_POOL_SIZE", getenv("NCCL_INSPECTOR_PROXY_STEP_POOL_SIZE"), "32768", "Fixed proxy step pool capacity"},
     {"NCCL_INSPECTOR_DUMP_THREAD_ENABLE", getenv("NCCL_INSPECTOR_DUMP_THREAD_ENABLE"), "1", "Enable/disable dump thread"},
     {"NCCL_INSPECTOR_DUMP_THREAD_INTERVAL_MICROSECONDS", getenv("NCCL_INSPECTOR_DUMP_THREAD_INTERVAL_MICROSECONDS"), "-1", "Dump interval in microseconds (-1 = disabled/dump only at teardown, 0 = continuous, >0 = periodic)"},
     {"NCCL_INSPECTOR_DUMP_DIR", getenv("NCCL_INSPECTOR_DUMP_DIR"), "(auto-generated)", "Output directory for inspector logs"},
@@ -937,6 +941,12 @@ static void initP2pTrackingFromEnv() {
   const char* str = getenv("NCCL_INSPECTOR_ENABLE_P2P");
   int enable = str ? atoi(str) : 1;
   enableNcclInspectorP2p = enable == 0 ? false : true;
+}
+
+static void initProxyStepTrackingFromEnv() {
+  const char* str = getenv("NCCL_INSPECTOR_PROXY_STEP_ENABLE");
+  int enable = str ? atoi(str) : 0;
+  enableNcclInspectorProxyStep = enable != 0;
 }
 
 /*
@@ -1099,6 +1109,7 @@ inspectorResult_t inspectorGlobalInit(int rank) {
 
   INS_CHK(inspectorGlobalStateInit());
   initP2pTrackingFromEnv();
+  initProxyStepTrackingFromEnv();
   initKernelTimingFromEnv();
   INS_CHK(inspectorEventPoolInitFromEnv());
   INS_CHK(initDumpThreadFromEnv());

@@ -16,6 +16,7 @@
 
 #include "json.h"
 #include "common.h"
+#include "inspector_proxy_stats.h"
 #include "version.h"
 
 #define MAX_CHANNELS                     64
@@ -236,6 +237,42 @@ struct inspectorKernelChInfo {
   uint64_t stopGpuClk;
 };
 
+struct inspectorProxyOpInfo {
+  uint64_t type;
+  struct inspectorCommInfo* commInfo;
+  uint64_t parentType;
+  ncclFunc_t func;
+  uint64_t sequence;
+  size_t messageSizeBytes;
+  int peer;
+  int rank;
+  int nranks;
+  int nnodes;
+  uint8_t channelId;
+  int isSend;
+  int64_t applicationStep;
+  char algo[NCCL_INSPECTOR_ALGO_NAME_MAX];
+  char proto[NCCL_INSPECTOR_PROTO_NAME_MAX];
+  uint64_t proxyStepCount;
+  uint64_t transferSizeBytes;
+  uint64_t phaseCount[inspectorProxyWaitPhaseCount];
+  uint64_t phaseSumUsecs[inspectorProxyWaitPhaseCount];
+  uint64_t phaseMaxUsecs[inspectorProxyWaitPhaseCount];
+  uint64_t missingTransitions;
+};
+
+struct inspectorProxyStepInfo {
+  uint64_t type;
+  struct inspectorProxyOpInfo* parent;
+  int transferStep;
+  int64_t applicationStep;
+  bool isSend;
+  uint64_t startUsecs;
+  uint64_t stopUsecs;
+  uint64_t stateUsecs[3];
+  size_t transferSizeBytes;
+};
+
 struct inspectorCollInfo {
   uint64_t type;
   int refCount;
@@ -325,6 +362,7 @@ inline int ncclTypeSize(ncclDataType_t type) {
 
 // Global flag to control P2P tracking
 extern bool enableNcclInspectorP2p;
+extern bool enableNcclInspectorProxyStep;
 extern bool requireKernelTiming;
 // Minimum message size (bytes) to be `tracked by inspector
 extern size_t ncclInspectorDumpMinSizeBytes;
