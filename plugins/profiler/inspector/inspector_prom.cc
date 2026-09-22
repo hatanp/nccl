@@ -1279,16 +1279,25 @@ static inspectorResult_t inspectorPromWriteStepFamilies(
     uint64_t gpuUnionNanosecs = 0;
     uint64_t unionStart = 0;
     uint64_t unionStop = 0;
+    std::vector<std::pair<uint64_t, uint64_t>> mergedGpuIntervals;
     for (const auto& interval : gpuIntervals) {
       if (unionStop == 0 || interval.first > unionStop) {
-        if (unionStop > unionStart) gpuUnionNanosecs += unionStop - unionStart;
+        if (unionStop > unionStart) {
+          gpuUnionNanosecs += unionStop - unionStart;
+          mergedGpuIntervals.emplace_back(unionStart, unionStop);
+        }
         unionStart = interval.first;
         unionStop = interval.second;
       } else {
         unionStop = std::max(unionStop, interval.second);
       }
     }
-    if (unionStop > unionStart) gpuUnionNanosecs += unionStop - unionStart;
+    if (unionStop > unionStart) {
+      gpuUnionNanosecs += unionStop - unionStart;
+      mergedGpuIntervals.emplace_back(unionStart, unionStop);
+    }
+    bool emitGpuIntervals = key.family == inspectorPromFamilyDp
+      || key.family == inspectorPromFamilyEdp;
     int written = snprintf(
       buffer, sizeof(buffer),
       "# nccl_inspector_step {\"step\":%" PRId64
@@ -1301,16 +1310,35 @@ static inspectorResult_t inspectorPromWriteStepFamilies(
       ",\"gpu_last_stop_ns\":%" PRIu64
       ",\"gpu_union_us\":%" PRIu64
       ",\"gpu_envelope_us\":%" PRIu64
-      "}\n",
+      ",\"gpu_merged_interval_count\":%zu"
+      ",\"gpu_intervals_ns\":[",
       key.step, inspectorPromSemanticFamilyName(key.family),
       ncclFuncToString(key.func), agg.count, agg.execTimeSum,
       agg.execTimeMax, firstStart, agg.lastStopTimestampUsecs,
       gpuIntervals.size(), firstGpuStart, agg.lastGpuStopNanosecs,
-      gpuUnionNanosecs / 1000, gpuEnvelopeUsecs);
+      gpuUnionNanosecs / 1000, gpuEnvelopeUsecs,
+      emitGpuIntervals ? mergedGpuIntervals.size() : size_t{0});
     if (written < 0 || (size_t)written >= sizeof(buffer)) {
       return inspectorMemoryError;
     }
     if (fwrite(buffer, 1, written, file) != (size_t)written) {
+      return inspectorFileOpenError;
+    }
+    if (emitGpuIntervals) {
+      for (size_t index = 0; index < mergedGpuIntervals.size(); index++) {
+        const auto& interval = mergedGpuIntervals[index];
+        int intervalWritten = snprintf(
+          buffer, sizeof(buffer), "%s[%" PRIu64 ",%" PRIu64 "]",
+          index ? "," : "", interval.first, interval.second);
+        if (intervalWritten < 0 || (size_t)intervalWritten >= sizeof(buffer)) {
+          return inspectorMemoryError;
+        }
+        if (fwrite(buffer, 1, intervalWritten, file) != (size_t)intervalWritten) {
+          return inspectorFileOpenError;
+        }
+      }
+    }
+    if (fwrite("]}\n", 1, 3, file) != 3) {
       return inspectorFileOpenError;
     }
   }

@@ -234,6 +234,9 @@ int main() {
   assert(output.find("\"gpu_last_stop_ns\":2000000") != std::string::npos);
   assert(output.find("\"gpu_union_us\":1000") != std::string::npos);
   assert(output.find("\"gpu_envelope_us\":1000") != std::string::npos);
+  assert(output.find("\"gpu_merged_interval_count\":1") != std::string::npos);
+  assert(output.find("\"gpu_intervals_ns\":[[1000000,2000000]]")
+         != std::string::npos);
 
   unlink(path.c_str());
   rmdir(outputDirectory);
