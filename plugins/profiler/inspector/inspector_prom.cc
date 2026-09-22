@@ -25,6 +25,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 #include <cmath>
 #include <unistd.h>
@@ -140,6 +141,9 @@ struct inspectorPromStepFamilyAgg {
   uint64_t execTimeMax = 0;
   uint64_t firstStartTimestampUsecs = std::numeric_limits<uint64_t>::max();
   uint64_t lastStopTimestampUsecs = 0;
+  uint64_t firstGpuStartNanosecs = std::numeric_limits<uint64_t>::max();
+  uint64_t lastGpuStopNanosecs = 0;
+  std::vector<std::pair<uint64_t, uint64_t>> gpuIntervals;
 };
 
 struct inspectorPromStepP2pEvent {
@@ -351,6 +355,13 @@ static void inspectorPromStepUpdate(inspectorPromDevice& device,
     agg.firstStartTimestampUsecs, operationStartUsecs);
   agg.lastStopTimestampUsecs = std::max(
     agg.lastStopTimestampUsecs, operationStopUsecs);
+  if (op.gpuStartNanosecs > 0 && op.gpuStopNanosecs > op.gpuStartNanosecs) {
+    agg.firstGpuStartNanosecs = std::min(
+      agg.firstGpuStartNanosecs, op.gpuStartNanosecs);
+    agg.lastGpuStopNanosecs = std::max(
+      agg.lastGpuStopNanosecs, op.gpuStopNanosecs);
+    agg.gpuIntervals.emplace_back(op.gpuStartNanosecs, op.gpuStopNanosecs);
+  }
   if (op.isP2p && family == inspectorPromFamilyPpCrossNode) {
     std::vector<inspectorPromStepP2pEvent>& events
       = device.stepP2pEvents[currentStep];
@@ -1260,6 +1271,24 @@ static inspectorResult_t inspectorPromWriteStepFamilies(
     const inspectorPromStepFamilyKey& key = entry.first;
     const inspectorPromStepFamilyAgg& agg = entry.second;
     uint64_t firstStart = agg.count ? agg.firstStartTimestampUsecs : 0;
+    uint64_t firstGpuStart = agg.gpuIntervals.empty() ? 0 : agg.firstGpuStartNanosecs;
+    uint64_t gpuEnvelopeUsecs = agg.gpuIntervals.empty()
+      ? 0 : (agg.lastGpuStopNanosecs - agg.firstGpuStartNanosecs) / 1000;
+    std::vector<std::pair<uint64_t, uint64_t>> gpuIntervals = agg.gpuIntervals;
+    std::sort(gpuIntervals.begin(), gpuIntervals.end());
+    uint64_t gpuUnionNanosecs = 0;
+    uint64_t unionStart = 0;
+    uint64_t unionStop = 0;
+    for (const auto& interval : gpuIntervals) {
+      if (unionStop == 0 || interval.first > unionStop) {
+        if (unionStop > unionStart) gpuUnionNanosecs += unionStop - unionStart;
+        unionStart = interval.first;
+        unionStop = interval.second;
+      } else {
+        unionStop = std::max(unionStop, interval.second);
+      }
+    }
+    if (unionStop > unionStart) gpuUnionNanosecs += unionStop - unionStart;
     int written = snprintf(
       buffer, sizeof(buffer),
       "# nccl_inspector_step {\"step\":%" PRId64
@@ -1267,10 +1296,17 @@ static inspectorResult_t inspectorPromWriteStepFamilies(
       ",\"count\":%" PRIu64 ",\"sum_us\":%.6g"
       ",\"max_us\":%" PRIu64
       ",\"first_start_us\":%" PRIu64 ",\"last_stop_us\":%" PRIu64
+      ",\"gpu_interval_count\":%zu"
+      ",\"gpu_first_start_ns\":%" PRIu64
+      ",\"gpu_last_stop_ns\":%" PRIu64
+      ",\"gpu_union_us\":%" PRIu64
+      ",\"gpu_envelope_us\":%" PRIu64
       "}\n",
       key.step, inspectorPromSemanticFamilyName(key.family),
       ncclFuncToString(key.func), agg.count, agg.execTimeSum,
-      agg.execTimeMax, firstStart, agg.lastStopTimestampUsecs);
+      agg.execTimeMax, firstStart, agg.lastStopTimestampUsecs,
+      gpuIntervals.size(), firstGpuStart, agg.lastGpuStopNanosecs,
+      gpuUnionNanosecs / 1000, gpuEnvelopeUsecs);
     if (written < 0 || (size_t)written >= sizeof(buffer)) {
       return inspectorMemoryError;
     }

@@ -150,6 +150,8 @@ struct inspectorCompletedOpInfo {
   uint64_t sn;
   size_t msgSizeBytes;
   uint64_t execTimeUsecs;
+  uint64_t gpuStartNanosecs;
+  uint64_t gpuStopNanosecs;
   inspectorTimingSource_t timingSource;
   double algoBwGbs;
   double busBwGbs;

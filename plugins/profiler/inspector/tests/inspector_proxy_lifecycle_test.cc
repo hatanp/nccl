@@ -73,7 +73,7 @@ int main() {
   coll.coll.func = "ReduceScatter";
   coll.coll.count = 1024;
   coll.coll.datatype = "float32";
-  coll.coll.nChannels = 0;
+  coll.coll.nChannels = 1;
   coll.coll.algo = "RING";
   coll.coll.proto = "SIMPLE";
   void* collHandle = nullptr;
@@ -95,6 +95,25 @@ int main() {
   assert(ncclProfiler_v5.startEvent(context, &proxyOpHandle, &proxyOp)
          == ncclSuccess);
   assert(proxyOpHandle != nullptr);
+
+  ncclProfilerEventDescr_t kernel;
+  memset(&kernel, 0, sizeof(kernel));
+  kernel.type = ncclProfileKernelCh;
+  kernel.parentObj = collHandle;
+  kernel.rank = 0;
+  kernel.kernelCh.channelId = 0;
+  kernel.kernelCh.pTimer = 1000000;
+  void* kernelHandle = nullptr;
+  assert(ncclProfiler_v5.startEvent(context, &kernelHandle, &kernel)
+         == ncclSuccess);
+  assert(kernelHandle != nullptr);
+  ncclProfilerEventStateArgs_t kernelStateArgs;
+  memset(&kernelStateArgs, 0, sizeof(kernelStateArgs));
+  kernelStateArgs.kernelCh.pTimer = 2000000;
+  assert(ncclProfiler_v5.recordEventState(
+           kernelHandle, ncclProfilerKernelChStop, &kernelStateArgs)
+         == ncclSuccess);
+  assert(ncclProfiler_v5.stopEvent(kernelHandle) == ncclSuccess);
 
   ncclProfilerEventDescr_t detachedProxyOp = proxyOp;
   detachedProxyOp.parentObj = reinterpret_cast<void*>(1);
@@ -135,6 +154,7 @@ int main() {
   ncclProfilerEventDescr_t replacementColl = coll;
   replacementColl.coll.seqNumber = 2;
   replacementColl.coll.func = "Broadcast";
+  replacementColl.coll.nChannels = 0;
   void* replacementCollHandle = nullptr;
   assert(ncclProfiler_v5.startEvent(
            context, &replacementCollHandle, &replacementColl) == ncclSuccess);
@@ -208,6 +228,12 @@ int main() {
   assert(output.find("\"unknown_transfer_sizes\":1") != std::string::npos);
   assert(output.find("\"missing_transitions\":0") != std::string::npos);
   assert(output.find("\"phase_count\":[1,1,1,0,0,0]") != std::string::npos);
+  assert(output.find("# nccl_inspector_step {") != std::string::npos);
+  assert(output.find("\"gpu_interval_count\":1") != std::string::npos);
+  assert(output.find("\"gpu_first_start_ns\":1000000") != std::string::npos);
+  assert(output.find("\"gpu_last_stop_ns\":2000000") != std::string::npos);
+  assert(output.find("\"gpu_union_us\":1000") != std::string::npos);
+  assert(output.find("\"gpu_envelope_us\":1000") != std::string::npos);
 
   unlink(path.c_str());
   rmdir(outputDirectory);

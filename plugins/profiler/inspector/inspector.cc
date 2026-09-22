@@ -1569,6 +1569,25 @@ static uint64_t calculateKernelGpuExecTimeUsecs(struct inspectorKernelChInfo *ke
   return 0;
 }
 
+static void calculateKernelGpuEnvelopeNanosecs(
+    struct inspectorKernelChInfo* kernelChannels,
+    uint32_t nChannels,
+    uint64_t* startNanosecs,
+    uint64_t* stopNanosecs) {
+  *startNanosecs = 0;
+  *stopNanosecs = 0;
+  for (uint32_t i = 0; i < nChannels; i++) {
+    const struct inspectorKernelChInfo* kernelCh = &kernelChannels[i];
+    if (kernelCh->startGpuClk == 0 || kernelCh->stopGpuClk <= kernelCh->startGpuClk) {
+      continue;
+    }
+    if (*startNanosecs == 0 || kernelCh->startGpuClk < *startNanosecs) {
+      *startNanosecs = kernelCh->startGpuClk;
+    }
+    *stopNanosecs = std::max(*stopNanosecs, kernelCh->stopGpuClk);
+  }
+}
+
 /*
  * Description:
  *
@@ -1655,6 +1674,9 @@ void inspectorUpdateCollPerf(struct inspectorCompletedOpInfo *completedOp,
   completedOp->msgSizeBytes = collInfo->msgSizeBytes;
   completedOp->execTimeUsecs =
     calculateMaxKernelExecTimeUsecs(collInfo, &completedOp->timingSource);
+  calculateKernelGpuEnvelopeNanosecs(
+    collInfo->kernelCh, collInfo->nChannels,
+    &completedOp->gpuStartNanosecs, &completedOp->gpuStopNanosecs);
   snprintf(completedOp->algo, sizeof(completedOp->algo), "%s",
            collInfo->algo ? collInfo->algo : "unknown");
   snprintf(completedOp->proto, sizeof(completedOp->proto), "%s",
@@ -1739,6 +1761,9 @@ void inspectorUpdateP2pPerf(struct inspectorCompletedOpInfo *completedOp,
   completedOp->peer = p2pInfo->peer;
   completedOp->execTimeUsecs =
     calculateMaxKernelExecTimeUsecsP2p(p2pInfo, &completedOp->timingSource);
+  calculateKernelGpuEnvelopeNanosecs(
+    p2pInfo->kernelCh, p2pInfo->nChannels,
+    &completedOp->gpuStartNanosecs, &completedOp->gpuStopNanosecs);
   completedOp->evtTrk = p2pInfo->p2pEvtTrk;
 }
 
