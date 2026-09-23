@@ -33,7 +33,8 @@ struct inspectorPromTopologySizes {
   int pp = 0;
 };
 
-static inline inspectorPromSemanticFamily inspectorPromClassifyFamily(
+// Legacy cardinality hint: used for stable aggregation, not semantic proof.
+static inline inspectorPromSemanticFamily inspectorPromClassifySizeFamily(
     bool isP2p,
     int nranks,
     int nnodes,
@@ -55,6 +56,35 @@ static inline inspectorPromSemanticFamily inspectorPromClassifyFamily(
     return inspectorPromFamilyEp;
   }
   return inspectorPromFamilyUnknown;
+}
+
+struct inspectorPromStepFamilyPolicy {
+  inspectorPromSemanticFamily family;
+  bool emitGpuIntervals;
+};
+
+static inline inspectorPromStepFamilyPolicy inspectorPromFamilyPolicy(
+    inspectorPromSemanticFamily sizeFamily, bool isAllReduce) {
+  // Cardinality cannot distinguish replica AllReduce from embedding or other
+  // model-parallel groups, including groups smaller than configured PP.
+  const bool ambiguous = isAllReduce
+    && (sizeFamily == inspectorPromFamilyDp
+        || sizeFamily == inspectorPromFamilyEdp
+        || sizeFamily == inspectorPromFamilyEp);
+  return {ambiguous ? inspectorPromFamilyUnknown : sizeFamily,
+          sizeFamily == inspectorPromFamilyDp
+            || sizeFamily == inspectorPromFamilyEdp};
+}
+
+static inline inspectorPromSemanticFamily inspectorPromClassifyFamily(
+    bool isP2p,
+    bool isAllReduce,
+    int nranks,
+    int nnodes,
+    const inspectorPromTopologySizes& sizes) {
+  return inspectorPromFamilyPolicy(
+    inspectorPromClassifySizeFamily(isP2p, nranks, nnodes, sizes),
+    isAllReduce && !isP2p).family;
 }
 
 static inline const char* inspectorPromSemanticFamilyName(

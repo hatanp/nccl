@@ -146,12 +146,17 @@ __hidden ncclResult_t inspectorPluginInit(void** context, uint64_t commHash,
       pthread_mutex_unlock(&gLock);
       return ncclSuccess;
     }
+    if (enableNcclInspectorParentIdentity) {
+      // Initialize entropy on the cold path, never on the first collective.
+      (void)inspectorParentProcessInstance();
+    }
     if (enableNcclInspectorProxyStep) {
       inspectorResult_t proxyResult = inspectorProxyPoolInit(
         inspectorProxyPoolSize("NCCL_INSPECTOR_PROXY_OP_POOL_SIZE", 8192),
         inspectorProxyPoolSize("NCCL_INSPECTOR_PROXY_STEP_POOL_SIZE", 32768));
       if (proxyResult != inspectorSuccess) {
         enableNcclInspectorProxyStep = false;
+        enableNcclInspectorParentIdentity = false;
         WARN_INSPECTOR(
           "Inspector: failed to initialize fixed proxy pools; disabling proxy tracking");
       }
@@ -299,6 +304,11 @@ static void inspectorPluginCollInfoInit(struct inspectorCollInfo **collInfo,
     return;
   }
   collInfoPtr->type = ncclProfileColl;
+  if (enableNcclInspectorParentIdentity) {
+    collInfoPtr->parentIdentity = inspectorParentSnapshot(
+      inspectorParentNextId(), eDescr->coll.sendBuff, eDescr->coll.recvBuff,
+      eDescr->coll.count, eDescr->coll.datatype);
+  }
   collInfoPtr->refCount = 0;
   inspectorPluginCollInfoRef(collInfoPtr); //self ref; no locks needed
   collInfoPtr->func = eDescr->coll.func;
@@ -530,6 +540,7 @@ static void inspectorPluginProxyOpInfoInit(
     inspectorPluginCollInfoRef(parent);
     event->func = ncclStringToFunc(parent->func);
     event->sequence = parent->sn;
+    event->parentIdentityId = parent->parentIdentity.id;
     event->messageSizeBytes = parent->msgSizeBytes;
     snprintf(event->algo, sizeof(event->algo), "%s",
              parent->algo ? parent->algo : "unknown");
@@ -962,6 +973,7 @@ __hidden ncclResult_t inspectorPluginStopEvent(void *eHandle) {
             peak.startUsecs = timeline.states[index];
             peak.stopUsecs = index < 2 ? timeline.states[index + 1] : timeline.stopUsecs;
             peak.sequence = parent->sequence;
+            peak.parentIdentityId = parent->parentIdentityId;
             peak.parentType = parent->parentType;
             peak.channel = parent->channelId;
             peak.peer = parent->peer;

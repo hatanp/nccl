@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include <fstream>
+#include <map>
 #include <sstream>
 #include <string>
 
@@ -34,7 +35,21 @@ static std::string findPromFile(const char* directory) {
   return result;
 }
 
-int main() {
+static uint64_t field(const std::string& line, const char* name) {
+  const std::string key = std::string("\"") + name + "\":";
+  const size_t offset = line.find(key);
+  assert(offset != std::string::npos);
+  return strtoull(line.c_str() + offset + key.size(), nullptr, 10);
+}
+
+int main(int argc, char** argv) {
+  assert(argc == 1 || (argc == 2 && (strcmp(argv[1], "off") == 0
+    || strcmp(argv[1], "cap0") == 0 || strcmp(argv[1], "cap1") == 0
+    || strcmp(argv[1], "missing") == 0)));
+  const bool missingDescriptor = argc == 2 && strcmp(argv[1], "missing") == 0;
+  const bool parentEnabled = argc == 1 || strcmp(argv[1], "off") != 0;
+  const size_t parentCap = argc == 2 && strcmp(argv[1], "cap0") == 0 ? 0
+    : argc == 2 && strcmp(argv[1], "cap1") == 0 ? 1 : 2;
   char outputTemplate[] = "/tmp/inspector-proxy-lifecycle-XXXXXX";
   char* outputDirectory = mkdtemp(outputTemplate);
   assert(outputDirectory != nullptr);
@@ -42,6 +57,8 @@ int main() {
   setenv("NCCL_INSPECTOR_ENABLE_P2P", "0", 1);
   setenv("NCCL_INSPECTOR_PROXY_STEP_ENABLE", "1", 1);
   setenv("NCCL_INSPECTOR_PROXY_PEAK_ENABLE", "1", 1);
+  setenv("NCCL_INSPECTOR_PARENT_IDENTITY_ENABLE", parentEnabled ? "1" : "0", 1);
+  setenv("NCCL_INSPECTOR_PARENT_DICTIONARY_CAPACITY", std::to_string(parentCap).c_str(), 1);
   setenv("NCCL_INSPECTOR_PROXY_OP_POOL_SIZE", "8", 1);
   setenv("NCCL_INSPECTOR_PROXY_STEP_POOL_SIZE", "8", 1);
   setenv("NCCL_INSPECTOR_DUMP_THREAD_ENABLE", "0", 1);
@@ -73,13 +90,24 @@ int main() {
   coll.coll.seqNumber = 1;
   coll.coll.func = "ReduceScatter";
   coll.coll.count = 1024;
-  coll.coll.datatype = "float32";
+  char originalDatatype[] = "ncclFloat32";
+  coll.coll.datatype = originalDatatype;
+  coll.coll.sendBuff = missingDescriptor ? nullptr : reinterpret_cast<void*>(0x1000);
+  coll.coll.recvBuff = reinterpret_cast<void*>(0x2000);
   coll.coll.nChannels = 1;
   coll.coll.algo = "RING";
   coll.coll.proto = "SIMPLE";
   void* collHandle = nullptr;
   assert(ncclProfiler_v5.startEvent(context, &collHandle, &coll) == ncclSuccess);
   assert(collHandle != nullptr);
+  const uint64_t firstParentId = static_cast<inspectorCollInfo*>(collHandle)->parentIdentity.id;
+  assert((firstParentId != 0) == parentEnabled);
+  // Descriptor values/string may be changed after start; retained metadata must
+  // still describe the original callback, never these replacements.
+  strcpy(originalDatatype, "ncclInt8");
+  coll.coll.sendBuff = reinterpret_cast<void*>(0xdead);
+  coll.coll.recvBuff = reinterpret_cast<void*>(0xbeef);
+  coll.coll.count = 2048;
 
   ncclProfilerEventDescr_t proxyOp;
   memset(&proxyOp, 0, sizeof(proxyOp));
@@ -121,7 +149,7 @@ int main() {
   detachedProxyOp.proxyOp.pid = getpid() + 1;
   void* detachedProxyOpHandle = reinterpret_cast<void*>(1);
   assert(ncclProfiler_v5.startEvent(
-           context, &detachedProxyOpHandle, &detachedProxyOp) == ncclSuccess);
+           reinterpret_cast<void*>(1), &detachedProxyOpHandle, &detachedProxyOp) == ncclSuccess);
   assert(detachedProxyOpHandle != nullptr);
   ncclProfilerEventDescr_t detachedProxyStep;
   memset(&detachedProxyStep, 0, sizeof(detachedProxyStep));
@@ -153,14 +181,42 @@ int main() {
   // and proxy stop so a missing proxy reference deterministically reuses it.
   assert(ncclProfiler_v5.stopEvent(collHandle) == ncclSuccess);
   ncclProfilerEventDescr_t replacementColl = coll;
-  replacementColl.coll.seqNumber = 2;
-  replacementColl.coll.func = "Broadcast";
+  replacementColl.coll.seqNumber = 1; // Same function/sequence/count, different buffers.
+  replacementColl.coll.func = "ReduceScatter";
+  replacementColl.coll.count = 1024;
+  replacementColl.coll.datatype = "ncclFloat32";
+  replacementColl.coll.sendBuff = reinterpret_cast<void*>(0x3000);
+  replacementColl.coll.recvBuff = reinterpret_cast<void*>(0x4000);
   replacementColl.coll.nChannels = 0;
   void* replacementCollHandle = nullptr;
   assert(ncclProfiler_v5.startEvent(
            context, &replacementCollHandle, &replacementColl) == ncclSuccess);
   assert(replacementCollHandle != nullptr);
   assert(replacementCollHandle != collHandle);
+  const uint64_t secondParentId = static_cast<inspectorCollInfo*>(replacementCollHandle)->parentIdentity.id;
+  if (parentEnabled) assert(secondParentId > firstParentId);
+  ncclProfilerEventDescr_t secondProxyOp = proxyOp;
+  secondProxyOp.parentObj = replacementCollHandle;
+  secondProxyOp.proxyOp.isSend = 0; // Distinct existing direction bin retains both witnesses.
+  void* secondProxyHandle = nullptr;
+  assert(ncclProfiler_v5.startEvent(context, &secondProxyHandle, &secondProxyOp) == ncclSuccess);
+  assert(secondProxyHandle != nullptr);
+  ncclProfilerEventDescr_t secondStep{};
+  secondStep.type = ncclProfileProxyStep;
+  secondStep.parentObj = secondProxyHandle;
+  void* secondStepHandle = nullptr;
+  assert(ncclProfiler_v5.startEvent(context, &secondStepHandle, &secondStep) == ncclSuccess);
+  assert(secondStepHandle != nullptr);
+  ncclProfilerEventStateArgs_t secondArgs{};
+  secondArgs.proxyStep.transSize = 4096;
+  assert(ncclProfiler_v5.recordEventState(secondStepHandle, ncclProfilerProxyStepRecvWait, &secondArgs) == ncclSuccess);
+  usleep(1000);
+  assert(ncclProfiler_v5.recordEventState(secondStepHandle, ncclProfilerProxyStepRecvFlushWait, &secondArgs) == ncclSuccess);
+  usleep(1000);
+  assert(ncclProfiler_v5.recordEventState(secondStepHandle, ncclProfilerProxyStepRecvGPUWait, &secondArgs) == ncclSuccess);
+  usleep(1000);
+  assert(ncclProfiler_v5.stopEvent(secondStepHandle) == ncclSuccess);
+  assert(ncclProfiler_v5.stopEvent(secondProxyHandle) == ncclSuccess);
 
   ncclProfilerEventDescr_t proxyStep;
   memset(&proxyStep, 0, sizeof(proxyStep));
@@ -196,6 +252,35 @@ int main() {
   assert(ncclProfiler_v5.stopEvent(proxyStepHandle) == ncclSuccess);
   assert(ncclProfiler_v5.stopEvent(proxyOpHandle) == ncclSuccess);
   assert(ncclProfiler_v5.stopEvent(replacementCollHandle) == ncclSuccess);
+  // A DP-sized communicator does not establish AllReduce semantics. Use a
+  // separate fixed descriptor and GPU interval to verify the emitted step row,
+  // while keeping the existing ReduceScatter and detached-PXN fixture intact.
+  ncclProfilerEventDescr_t ambiguousColl = coll;
+  ambiguousColl.coll.seqNumber = 3;
+  ambiguousColl.coll.func = "AllReduce";
+  ambiguousColl.coll.datatype = "ncclFloat32";
+  ambiguousColl.coll.count = 463339520; // 1,853,358,080 bytes of float32.
+  void* ambiguousCollHandle = nullptr;
+  assert(ncclProfiler_v5.startEvent(
+           context, &ambiguousCollHandle, &ambiguousColl) == ncclSuccess);
+  assert(ambiguousCollHandle != nullptr);
+  assert(ambiguousCollHandle == replacementCollHandle); // Free-list address reused.
+  if (parentEnabled) {
+    assert(static_cast<inspectorCollInfo*>(ambiguousCollHandle)->parentIdentity.id > secondParentId);
+  }
+  ncclProfilerEventDescr_t ambiguousKernel = kernel;
+  ambiguousKernel.parentObj = ambiguousCollHandle;
+  ambiguousKernel.kernelCh.pTimer = 3000000;
+  void* ambiguousKernelHandle = nullptr;
+  assert(ncclProfiler_v5.startEvent(
+           context, &ambiguousKernelHandle, &ambiguousKernel) == ncclSuccess);
+  assert(ambiguousKernelHandle != nullptr);
+  kernelStateArgs.kernelCh.pTimer = 4000000;
+  assert(ncclProfiler_v5.recordEventState(
+           ambiguousKernelHandle, ncclProfilerKernelChStop, &kernelStateArgs)
+         == ncclSuccess);
+  assert(ncclProfiler_v5.stopEvent(ambiguousKernelHandle) == ncclSuccess);
+  assert(ncclProfiler_v5.stopEvent(ambiguousCollHandle) == ncclSuccess);
   assert(ncclInspectorStepEnd(7, 0) == 0);
   assert(ncclProfiler_v5.finalize(context) == ncclSuccess);
 
@@ -245,6 +330,79 @@ int main() {
   assert(output.find("\"gpu_merged_interval_count\":1") != std::string::npos);
   assert(output.find("\"gpu_intervals_ns\":[[1000000,2000000]]")
          != std::string::npos);
+
+  assert(output.find("version=\"v5.9\"") != std::string::npos);
+  const std::string ambiguousPrefix =
+    "# nccl_inspector_step {\"step\":7,\"family\":\"unknown\","
+    "\"size_family_hint\":\"dp\",\"operation\":\"AllReduce\"";
+  const size_t ambiguousStart = output.find(ambiguousPrefix);
+  assert(ambiguousStart != std::string::npos);
+  const size_t ambiguousEnd = output.find('\n', ambiguousStart);
+  assert(ambiguousEnd != std::string::npos);
+  const std::string ambiguousRow = output.substr(
+    ambiguousStart, ambiguousEnd - ambiguousStart);
+  // Restrict assertions to this row: the original RS row must not satisfy them.
+  assert(ambiguousRow.find("\"count\":1,") != std::string::npos);
+  assert(ambiguousRow.find("\"sum_us\":") != std::string::npos);
+  assert(ambiguousRow.find("\"max_us\":") != std::string::npos);
+  assert(ambiguousRow.find("\"first_start_us\":") != std::string::npos);
+  assert(ambiguousRow.find("\"last_stop_us\":") != std::string::npos);
+  assert(ambiguousRow.find("\"gpu_interval_count\":1,") != std::string::npos);
+  assert(ambiguousRow.find("\"gpu_first_start_ns\":3000000,")
+         != std::string::npos);
+  assert(ambiguousRow.find("\"gpu_last_stop_ns\":4000000,")
+         != std::string::npos);
+  assert(ambiguousRow.find("\"gpu_union_us\":1000,") != std::string::npos);
+  assert(ambiguousRow.find("\"gpu_envelope_us\":1000,") != std::string::npos);
+  assert(ambiguousRow.find("\"gpu_merged_interval_count\":1,")
+         != std::string::npos);
+  assert(ambiguousRow.find("\"gpu_intervals_ns\":[[3000000,4000000]]")
+         != std::string::npos);
+
+  const size_t expectedDictionaryEntries = parentEnabled
+    ? parentCap - (missingDescriptor && parentCap > 0 ? 1 : 0) : 0;
+  std::istringstream lines(output);
+  std::map<uint64_t, std::string> parentRows;
+  std::string line;
+  unsigned localPeakRecords = 0;
+  unsigned unavailableLocalPeaks = 0;
+  uint64_t reportedUnavailable = 0;
+  while (std::getline(lines, line)) {
+    if (line.find("# nccl_inspector_proxy_parent ") == 0) {
+      const uint64_t id = field(line, "parent_id");
+      assert(parentRows.emplace(id, line).second);
+      assert(line.find("\"native_count\":1024") != std::string::npos);
+      assert(line.find("\"native_datatype\":\"ncclFloat32\"") != std::string::npos);
+    } else if (line.find("# nccl_inspector_step_proxy_info ") == 0) {
+      reportedUnavailable = field(line, "parent_metadata_unavailable_peak_records");
+      assert(field(line, "parent_dictionary_entries") == expectedDictionaryEntries);
+    } else if (line.find("# nccl_inspector_step_proxy_peak ") == 0) {
+      const uint64_t id = field(line, "parent_id");
+      const bool metadataKnown = line.find("\"parent_metadata_known\":true") != std::string::npos;
+      if (line.find("\"identity_known\":false") != std::string::npos) {
+        assert(id == 0 && !metadataKnown); // Invalid foreign pointers never produce metadata.
+      } else {
+        localPeakRecords++;
+        assert(id == firstParentId || id == secondParentId);
+        const bool expectedKnown = parentEnabled && parentCap > 0
+          && (parentCap > 1 || id == firstParentId)
+          && !(missingDescriptor && id == firstParentId);
+        assert(metadataKnown == expectedKnown);
+        if (!metadataKnown) unavailableLocalPeaks++;
+      }
+    }
+  }
+  assert(localPeakRecords == 6);
+  assert(parentRows.size() == expectedDictionaryEntries);
+  assert(reportedUnavailable == (parentEnabled ? unavailableLocalPeaks : 0));
+  if (parentEnabled && parentCap > 0 && !missingDescriptor) {
+    assert(parentRows.at(firstParentId).find("\"send_buffer\":\"0x1000\"") != std::string::npos);
+    assert(parentRows.at(firstParentId).find("\"recv_buffer\":\"0x2000\"") != std::string::npos);
+  }
+  if (parentEnabled && parentCap > 1) {
+    assert(parentRows.at(secondParentId).find("\"send_buffer\":\"0x3000\"") != std::string::npos);
+    assert(parentRows.at(secondParentId).find("\"recv_buffer\":\"0x4000\"") != std::string::npos);
+  }
 
   unlink(path.c_str());
   rmdir(outputDirectory);

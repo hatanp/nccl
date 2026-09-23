@@ -65,6 +65,7 @@ static bool ncclInspectorInit = false;
 bool enableNcclInspectorP2p = true;
 bool enableNcclInspectorProxyStep = false;
 bool enableNcclInspectorProxyPeak = false;
+bool enableNcclInspectorParentIdentity = false;
 
 bool inspectorPromStreamingEnabled() {
   return enableNcclInspectorPromDump && retainNcclInspectorPromDump
@@ -843,6 +844,8 @@ static void showInspectorEnvVars() {
     {"NCCL_INSPECTOR_ENABLE_P2P", getenv("NCCL_INSPECTOR_ENABLE_P2P"), "1", "Enable/disable P2P tracking"},
     {"NCCL_INSPECTOR_PROXY_STEP_ENABLE", getenv("NCCL_INSPECTOR_PROXY_STEP_ENABLE"), "0", "Enable bounded proxy operation/step wait-state tracking"},
     {"NCCL_INSPECTOR_PROXY_PEAK_ENABLE", getenv("NCCL_INSPECTOR_PROXY_PEAK_ENABLE"), "0", "Retain exact identity and host interval for each proxy phase maximum"},
+    {"NCCL_INSPECTOR_PARENT_IDENTITY_ENABLE", getenv("NCCL_INSPECTOR_PARENT_IDENTITY_ENABLE"), "0", "Opt in to local collective parent descriptors for retained proxy peaks"},
+    {"NCCL_INSPECTOR_PARENT_DICTIONARY_CAPACITY", getenv("NCCL_INSPECTOR_PARENT_DICTIONARY_CAPACITY"), "4096", "Dump-time parent dictionary cap (0 disables, maximum 65536)"},
     {"NCCL_INSPECTOR_PROXY_OP_POOL_SIZE", getenv("NCCL_INSPECTOR_PROXY_OP_POOL_SIZE"), "8192", "Fixed proxy operation pool capacity"},
     {"NCCL_INSPECTOR_PROXY_STEP_POOL_SIZE", getenv("NCCL_INSPECTOR_PROXY_STEP_POOL_SIZE"), "32768", "Fixed proxy step pool capacity"},
     {"NCCL_INSPECTOR_DUMP_THREAD_ENABLE", getenv("NCCL_INSPECTOR_DUMP_THREAD_ENABLE"), "1", "Enable/disable dump thread"},
@@ -951,6 +954,9 @@ static void initProxyStepTrackingFromEnv() {
   enableNcclInspectorProxyStep = enable != 0;
   const char* peak = getenv("NCCL_INSPECTOR_PROXY_PEAK_ENABLE");
   enableNcclInspectorProxyPeak = enableNcclInspectorProxyStep && peak && atoi(peak) != 0;
+  const char* parent = getenv("NCCL_INSPECTOR_PARENT_IDENTITY_ENABLE");
+  enableNcclInspectorParentIdentity = enableNcclInspectorProxyPeak
+    && parent && atoi(parent) != 0;
 }
 
 /*

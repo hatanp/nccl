@@ -197,6 +197,7 @@ struct inspectorPromStepProxyAgg {
   uint64_t phaseSumUsecs[inspectorProxyWaitPhaseCount] = {0, 0, 0, 0, 0, 0};
   uint64_t phaseMaxUsecs[inspectorProxyWaitPhaseCount] = {0, 0, 0, 0, 0, 0};
   inspectorProxyPhasePeak phasePeaks[inspectorProxyWaitPhaseCount] = {};
+  inspectorParentIdentity phaseParents[inspectorProxyWaitPhaseCount] = {};
   uint64_t missingTransitions = 0;
 };
 
@@ -220,7 +221,7 @@ struct inspectorPromDevice {
   uint64_t p2pOverwritten = 0;
   bool hasData = false;
 };
-static const int kInspectorPromFormatMinor = 7;
+static const int kInspectorPromFormatMinor = 9;
 static const size_t kInspectorPromPercentileSampleCapacity = 256;
 static const size_t kInspectorPromGlobalSlowEventCapacity = 4;
 static std::mutex gInspectorPromStreamingMutex;
@@ -340,7 +341,9 @@ static void inspectorPromStepUpdate(inspectorPromDevice& device,
   int64_t currentStep = gInspectorPromCurrentStep.load(std::memory_order_relaxed);
   if (!inspectorPromStepEnabled() || currentStep < 0) return;
   inspectorPromTopologySizes sizes = inspectorPromGetTopologySizes();
-  inspectorPromSemanticFamily family = inspectorPromClassifyFamily(
+  // Keep the original bins and event eligibility; semantic labels are applied
+  // only at emission so counts, timing unions and interval policy do not change.
+  inspectorPromSemanticFamily family = inspectorPromClassifySizeFamily(
     op.isP2p, commInfo->nranks, commInfo->nnodes, sizes);
   if (family == inspectorPromFamilyUnknown) return;
   inspectorPromStepFamilyKey key {currentStep, family, op.func};
@@ -401,7 +404,8 @@ inspectorResult_t inspectorPromRecordProxyOp(
   inspectorPromSemanticFamily family = op->detached
     ? inspectorPromFamilyPxn
     : inspectorPromClassifyFamily(
-        op->parentType == ncclProfileP2p, op->nranks, op->nnodes, sizes);
+        op->parentType == ncclProfileP2p, op->func == ncclFuncAllReduce,
+        op->nranks, op->nnodes, sizes);
   std::lock_guard<std::mutex> lock(gInspectorPromStreamingMutex);
   const bool hasComm = !op->detached && op->commInfo != nullptr;
   inspectorPromStepProxyKey key {
@@ -426,6 +430,13 @@ inspectorResult_t inspectorPromRecordProxyOp(
     devicePtr = &device;
   }
   inspectorPromStepProxyAgg& agg = *aggPtr;
+  inspectorParentIdentity parentIdentity{};
+  // The local parent reference is released only after this function returns.
+  // Detached PXN never dereferences its foreign parent/context values.
+  if (enableNcclInspectorParentIdentity && !op->detached
+      && op->parentType == ncclProfileColl && op->parentObj != nullptr) {
+    parentIdentity = static_cast<const inspectorCollInfo*>(op->parentObj)->parentIdentity;
+  }
   agg.count += op->proxyStepCount;
   agg.transferBytes += op->transferSizeBytes;
   agg.unknownTransferSizes += op->unknownTransferSizes;
@@ -436,7 +447,13 @@ inspectorResult_t inspectorPromRecordProxyOp(
     agg.phaseMaxUsecs[phase] = std::max(
       agg.phaseMaxUsecs[phase], op->phaseMaxUsecs[phase]);
     if (enableNcclInspectorProxyPeak) {
-      inspectorProxySelectPeak(agg.phasePeaks[phase], op->phasePeaks[phase]);
+      if (enableNcclInspectorParentIdentity) {
+        inspectorProxySelectPeakWithParent(
+          agg.phasePeaks[phase], agg.phaseParents[phase],
+          op->phasePeaks[phase], parentIdentity);
+      } else {
+        inspectorProxySelectPeak(agg.phasePeaks[phase], op->phasePeaks[phase]);
+      }
     }
   }
   if (devicePtr != nullptr) devicePtr->hasData = true;
@@ -1300,12 +1317,14 @@ static inspectorResult_t inspectorPromWriteStepFamilies(
       gpuUnionNanosecs += unionStop - unionStart;
       mergedGpuIntervals.emplace_back(unionStart, unionStop);
     }
-    bool emitGpuIntervals = key.family == inspectorPromFamilyDp
-      || key.family == inspectorPromFamilyEdp;
+    const inspectorPromStepFamilyPolicy policy = inspectorPromFamilyPolicy(
+      key.family, key.func == ncclFuncAllReduce);
+    bool emitGpuIntervals = policy.emitGpuIntervals;
     int written = snprintf(
       buffer, sizeof(buffer),
       "# nccl_inspector_step {\"step\":%" PRId64
-      ",\"family\":\"%s\",\"operation\":\"%s\""
+      ",\"family\":\"%s\",\"size_family_hint\":\"%s\""
+      ",\"operation\":\"%s\""
       ",\"count\":%" PRIu64 ",\"sum_us\":%.6g"
       ",\"max_us\":%" PRIu64
       ",\"first_start_us\":%" PRIu64 ",\"last_stop_us\":%" PRIu64
@@ -1316,7 +1335,8 @@ static inspectorResult_t inspectorPromWriteStepFamilies(
       ",\"gpu_envelope_us\":%" PRIu64
       ",\"gpu_merged_interval_count\":%zu"
       ",\"gpu_intervals_ns\":[",
-      key.step, inspectorPromSemanticFamilyName(key.family),
+      key.step, inspectorPromSemanticFamilyName(policy.family),
+      inspectorPromSemanticFamilyName(key.family),
       ncclFuncToString(key.func), agg.count, agg.execTimeSum,
       agg.execTimeMax, firstStart, agg.lastStopTimestampUsecs,
       gpuIntervals.size(), firstGpuStart, agg.lastGpuStopNanosecs,
@@ -1349,6 +1369,22 @@ static inspectorResult_t inspectorPromWriteStepFamilies(
   return inspectorSuccess;
 }
 
+static size_t inspectorPromParentDictionaryCapacity() {
+  static const size_t capacity = []() {
+    const char* value = getenv("NCCL_INSPECTOR_PARENT_DICTIONARY_CAPACITY");
+    if (value == nullptr || value[0] == '\0') return size_t{4096};
+    char* end = nullptr;
+    errno = 0;
+    unsigned long parsed = strtoul(value, &end, 10);
+    // Explicit zero disables dictionary retention. Invalid/oversized settings
+    // fail closed rather than accidentally allocating an unbounded dictionary.
+    if (errno || end == value || *end != '\0' || value[0] == '-'
+        || parsed > 65536) return size_t{0};
+    return static_cast<size_t>(parsed);
+  }();
+  return capacity;
+}
+
 static inspectorResult_t inspectorPromWriteStepProxy(
     FILE* file,
     const std::map<inspectorPromStepProxyKey,
@@ -1356,12 +1392,43 @@ static inspectorResult_t inspectorPromWriteStepProxy(
   if (!file) return inspectorFileOpenError;
   char buffer[3072];
   inspectorPromTopologySizes sizes = inspectorPromGetTopologySizes();
+  const size_t parentCapacity = enableNcclInspectorParentIdentity
+    ? inspectorPromParentDictionaryCapacity() : 0;
+  inspectorParentDictionary parents(parentCapacity);
+  uint64_t parentUnavailablePeaks = 0;
+  if (enableNcclInspectorParentIdentity) {
+    for (const auto& entry : proxy) {
+      for (int phase = 0; phase < inspectorProxyWaitPhaseCount; phase++) {
+        const auto& peak = entry.second.phasePeaks[phase];
+        if (peak.startUsecs != 0 && peak.identityKnown
+            && peak.parentType == ncclProfileColl) {
+          parents.consider(entry.second.phaseParents[phase]);
+        }
+      }
+    }
+    for (const auto& entry : proxy) {
+      for (int phase = 0; phase < inspectorProxyWaitPhaseCount; phase++) {
+        const auto& peak = entry.second.phasePeaks[phase];
+        const auto& metadata = entry.second.phaseParents[phase];
+        if (peak.startUsecs != 0 && peak.identityKnown
+            && peak.parentType == ncclProfileColl
+            && (!inspectorParentIdentityKnown(metadata)
+                || metadata.id != peak.parentIdentityId
+                || !parents.contains(peak.parentIdentityId))) parentUnavailablePeaks++;
+      }
+    }
+  }
+  const char* parentInstance = enableNcclInspectorParentIdentity
+    ? inspectorParentProcessInstance() : "";
   int infoWritten = snprintf(
     buffer, sizeof(buffer),
     "# nccl_inspector_step_proxy_info {\"records\":%zu,"
     "\"dropped_ops\":%" PRIu64 ",\"dropped_steps\":%" PRIu64
     ",\"detached_ops\":%" PRIu64
     ",\"peak_schema\":1,\"peak_enabled\":%s"
+    ",\"parent_identity_schema\":1,\"parent_identity_enabled\":%s"
+    ",\"parent_process_instance\":\"%s\",\"parent_dictionary_capacity\":%zu"
+    ",\"parent_dictionary_entries\":%zu,\"parent_metadata_unavailable_peak_records\":%" PRIu64
     ",\"world_size\":%d,\"dp_size\":%d,\"edp_size\":%d"
     ",\"ep_size\":%d,\"pp_size\":%d"
     ",\"phase_fields\":[\"send_gpu_wait\",\"send_peer_wait\","
@@ -1369,6 +1436,8 @@ static inspectorResult_t inspectorPromWriteStepProxy(
     "\"recv_gpu_wait\"]}\n",
     proxy.size(), inspectorProxyPoolDroppedOps(), inspectorProxyPoolDroppedSteps(),
     inspectorProxyPoolDetachedOps(), enableNcclInspectorProxyPeak ? "true" : "false",
+    enableNcclInspectorParentIdentity ? "true" : "false", parentInstance,
+    parentCapacity, parents.available(), parentUnavailablePeaks,
     sizes.world, sizes.dp, sizes.edp,
     sizes.ep, sizes.pp);
   if (infoWritten < 0 || (size_t)infoWritten >= sizeof(buffer)) {
@@ -1376,6 +1445,20 @@ static inspectorResult_t inspectorPromWriteStepProxy(
   }
   if (fwrite(buffer, 1, infoWritten, file) != (size_t)infoWritten) {
     return inspectorFileOpenError;
+  }
+  for (const auto& entry : parents.entries()) {
+    if (!parents.contains(entry.first)) continue;
+    const auto& identity = entry.second.identity;
+    int written = snprintf(
+      buffer, sizeof(buffer),
+      "# nccl_inspector_proxy_parent {\"schema\":1,\"process_instance\":\"%s\""
+      ",\"parent_id\":%" PRIu64
+      ",\"send_buffer\":\"0x%" PRIxPTR "\",\"recv_buffer\":\"0x%" PRIxPTR "\""
+      ",\"native_count\":%" PRIu64 ",\"native_datatype\":\"%s\"}\n",
+      parentInstance, identity.id, identity.sendBuffer, identity.recvBuffer,
+      identity.count, inspectorParentDatatypeName(identity.datatype));
+    if (written < 0 || static_cast<size_t>(written) >= sizeof(buffer)) return inspectorMemoryError;
+    if (fwrite(buffer, 1, written, file) != static_cast<size_t>(written)) return inspectorFileOpenError;
   }
   for (const auto& entry : proxy) {
     const inspectorPromStepProxyKey& key = entry.first;
@@ -1424,6 +1507,7 @@ static inspectorResult_t inspectorPromWriteStepProxy(
           ",\"direction\":\"%s\",\"comm_id\":\"%s\",\"comm_rank\":%d"
           ",\"nranks\":%d,\"n_nodes\":%d,\"phase\":\"%s\""
           ",\"identity_known\":%s,\"parent_type\":%" PRIu64
+          ",\"parent_id\":%" PRIu64 ",\"parent_metadata_known\":%s"
           ",\"sequence\":%" PRIu64 ",\"channel\":%d,\"peer\":%d"
           ",\"transfer_step\":%d,\"start_us\":%" PRIu64
           ",\"stop_us\":%" PRIu64 ",\"duration_us\":%" PRIu64
@@ -1435,6 +1519,10 @@ static inspectorResult_t inspectorPromWriteStepProxy(
           key.nranks, key.nnodes,
           inspectorProxyWaitPhaseName(static_cast<inspectorProxyWaitPhase>(phase)),
           peak.identityKnown ? "true" : "false", peak.parentType,
+          peak.parentIdentityId,
+          (inspectorParentIdentityKnown(agg.phaseParents[phase])
+           && agg.phaseParents[phase].id == peak.parentIdentityId
+           && parents.contains(peak.parentIdentityId)) ? "true" : "false",
           peak.sequence, peak.channel, peak.peer, peak.transferStep,
           peak.startUsecs, peak.stopUsecs, peak.stopUsecs - peak.startUsecs);
         if (peakWritten < 0 || (size_t)peakWritten >= sizeof(buffer)) {
@@ -1898,7 +1986,9 @@ static void inspectorPromMergeStepProxyAgg(
     target.phaseSumUsecs[phase] += source.phaseSumUsecs[phase];
     target.phaseMaxUsecs[phase] = std::max(
       target.phaseMaxUsecs[phase], source.phaseMaxUsecs[phase]);
-    inspectorProxySelectPeak(target.phasePeaks[phase], source.phasePeaks[phase]);
+    inspectorProxySelectPeakWithParent(
+      target.phasePeaks[phase], target.phaseParents[phase],
+      source.phasePeaks[phase], source.phaseParents[phase]);
   }
 }
 

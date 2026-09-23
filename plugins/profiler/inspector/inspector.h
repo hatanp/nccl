@@ -17,6 +17,7 @@
 #include "json.h"
 #include "common.h"
 #include "inspector_proxy_stats.h"
+#include "inspector_parent_identity.h"
 #include "version.h"
 
 #define MAX_CHANNELS                     64
@@ -241,6 +242,7 @@ struct inspectorKernelChInfo {
 
 struct inspectorProxyOpInfo {
   uint64_t type;
+  uint64_t parentIdentityId;
   struct inspectorCommInfo* commInfo;
   uint64_t parentType;
   void* parentObj;
@@ -282,6 +284,7 @@ struct inspectorProxyStepInfo {
 
 struct inspectorCollInfo {
   uint64_t type;
+  inspectorParentIdentity parentIdentity;
   int refCount;
   struct inspectorCommInfo *commInfo;
   const char* func;
@@ -371,6 +374,7 @@ inline int ncclTypeSize(ncclDataType_t type) {
 extern bool enableNcclInspectorP2p;
 extern bool enableNcclInspectorProxyStep;
 extern bool enableNcclInspectorProxyPeak;
+extern bool enableNcclInspectorParentIdentity;
 extern bool requireKernelTiming;
 // Minimum message size (bytes) to be `tracked by inspector
 extern size_t ncclInspectorDumpMinSizeBytes;

@@ -2,6 +2,7 @@
 #define NCCL_INSPECTOR_PROXY_STATS_H_
 
 #include <stdint.h>
+#include "inspector_parent_identity.h"
 
 enum inspectorProxyWaitPhase {
   inspectorProxySendGpuWait = 0,
@@ -28,6 +29,7 @@ struct inspectorProxyWaitDurations {
 // One exact witness for a phase maximum, never an independently merged set of
 // identity fields. Host timestamps use inspectorGetTime(), not GPU pTimer.
 struct inspectorProxyPhasePeak {
+  uint64_t parentIdentityId;
   uint64_t startUsecs;
   uint64_t stopUsecs;
   uint64_t sequence;
@@ -64,6 +66,18 @@ static inline bool inspectorProxySelectPeak(
     }
   }
   target = candidate;
+  return true;
+}
+
+// Select the original witness with exactly the existing comparison policy,
+// then copy its parent values as one unit. No live parent pointer is retained.
+static inline bool inspectorProxySelectPeakWithParent(
+    inspectorProxyPhasePeak& target, inspectorParentIdentity& targetParent,
+    const inspectorProxyPhasePeak& candidate,
+    const inspectorParentIdentity& candidateParent) {
+  if (!inspectorProxySelectPeak(target, candidate)) return false;
+  targetParent = candidate.parentIdentityId == candidateParent.id
+    ? candidateParent : inspectorParentIdentity{};
   return true;
 }
 
