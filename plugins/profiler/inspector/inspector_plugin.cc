@@ -956,6 +956,19 @@ __hidden ncclResult_t inspectorPluginStopEvent(void *eHandle) {
           parent->phaseSumUsecs[phase] += durations.usecs[phase];
           parent->phaseMaxUsecs[phase] = std::max(
             parent->phaseMaxUsecs[phase], durations.usecs[phase]);
+          if (enableNcclInspectorProxyPeak) {
+            int index = phase - firstPhase;
+            inspectorProxyPhasePeak peak{};
+            peak.startUsecs = timeline.states[index];
+            peak.stopUsecs = index < 2 ? timeline.states[index + 1] : timeline.stopUsecs;
+            peak.sequence = parent->sequence;
+            peak.parentType = parent->parentType;
+            peak.channel = parent->channelId;
+            peak.peer = parent->peer;
+            peak.transferStep = proxyStep->transferStep;
+            peak.identityKnown = !parent->detached;
+            inspectorProxySelectPeak(parent->phasePeaks[phase], peak);
+          }
         } else {
           parent->missingTransitions++;
         }

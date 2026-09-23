@@ -41,6 +41,7 @@ int main() {
   setenv("NCCL_INSPECTOR_ENABLE", "1", 1);
   setenv("NCCL_INSPECTOR_ENABLE_P2P", "0", 1);
   setenv("NCCL_INSPECTOR_PROXY_STEP_ENABLE", "1", 1);
+  setenv("NCCL_INSPECTOR_PROXY_PEAK_ENABLE", "1", 1);
   setenv("NCCL_INSPECTOR_PROXY_OP_POOL_SIZE", "8", 1);
   setenv("NCCL_INSPECTOR_PROXY_STEP_POOL_SIZE", "8", 1);
   setenv("NCCL_INSPECTOR_DUMP_THREAD_ENABLE", "0", 1);
@@ -205,6 +206,13 @@ int main() {
   buffer << input.rdbuf();
   std::string output = buffer.str();
   assert(output.find("# nccl_inspector_step_proxy_info") != std::string::npos);
+  assert(output.find("# nccl_inspector_step_proxy_peak {") != std::string::npos);
+  assert(output.find("\"identity_known\":true") != std::string::npos);
+  assert(output.find("\"identity_known\":false") != std::string::npos);
+  assert(output.find("\"sequence\":1,\"channel\":0,\"peer\":1") != std::string::npos);
+  assert(output.find("\"clock\":\"host_gettimeofday_us\"") != std::string::npos);
+  assert(output.find("\"retention\":\"max_per_phase_per_aggregate\"") != std::string::npos);
+
   assert(output.find("\"dropped_ops\":0") != std::string::npos);
   assert(output.find("\"dropped_steps\":0") != std::string::npos);
   assert(output.find("\"detached_ops\":1") != std::string::npos);

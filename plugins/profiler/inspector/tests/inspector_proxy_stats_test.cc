@@ -43,5 +43,41 @@ int main() {
 
   assert(std::string(inspectorProxyWaitPhaseName(inspectorProxyRecvFlushWait))
          == "recv_flush_wait");
+
+  inspectorProxyPhasePeak selected{};
+  inspectorProxyPhasePeak first{};
+  first.startUsecs = 100;
+  first.stopUsecs = 130;
+  first.sequence = 5;
+  first.peer = 7;
+  first.transferStep = 2;
+  first.identityKnown = true;
+  assert(inspectorProxySelectPeak(selected, first));
+  inspectorProxyPhasePeak longer = first;
+  longer.startUsecs = 200;
+  longer.stopUsecs = 260;
+  longer.sequence = 9;
+  longer.peer = 11;
+  longer.transferStep = 4;
+  assert(inspectorProxySelectPeak(selected, longer));
+  assert(selected.sequence == 9 && selected.peer == 11 && selected.transferStep == 4);
+  assert(!inspectorProxySelectPeak(selected, first));
+  inspectorProxyPhasePeak invalid = first;
+  invalid.stopUsecs = 99;
+  assert(!inspectorProxySelectPeak(selected, invalid));
+  inspectorProxyPhasePeak equal = longer;
+  equal.sequence = 8;
+  equal.peer = 12;
+  assert(inspectorProxySelectPeak(selected, equal));
+  assert(!inspectorProxySelectPeak(selected, longer));
+  assert(selected.sequence == 8 && selected.peer == 12);
+  inspectorProxyPhasePeak reverse{};
+  assert(inspectorProxySelectPeak(reverse, equal));
+  assert(!inspectorProxySelectPeak(reverse, longer));
+  assert(reverse.sequence == selected.sequence && reverse.peer == selected.peer);
+  inspectorProxyPhasePeak zero{};
+  first.stopUsecs = first.startUsecs;
+  assert(inspectorProxySelectPeak(zero, first));
+  assert(zero.startUsecs == 100 && zero.stopUsecs == 100);
   return 0;
 }

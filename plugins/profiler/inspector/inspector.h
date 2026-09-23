@@ -263,6 +263,7 @@ struct inspectorProxyOpInfo {
   uint64_t phaseCount[inspectorProxyWaitPhaseCount];
   uint64_t phaseSumUsecs[inspectorProxyWaitPhaseCount];
   uint64_t phaseMaxUsecs[inspectorProxyWaitPhaseCount];
+  inspectorProxyPhasePeak phasePeaks[inspectorProxyWaitPhaseCount];
   uint64_t missingTransitions;
 };
 
@@ -369,6 +370,7 @@ inline int ncclTypeSize(ncclDataType_t type) {
 // Global flag to control P2P tracking
 extern bool enableNcclInspectorP2p;
 extern bool enableNcclInspectorProxyStep;
+extern bool enableNcclInspectorProxyPeak;
 extern bool requireKernelTiming;
 // Minimum message size (bytes) to be `tracked by inspector
 extern size_t ncclInspectorDumpMinSizeBytes;

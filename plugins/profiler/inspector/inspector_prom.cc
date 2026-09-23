@@ -196,6 +196,7 @@ struct inspectorPromStepProxyAgg {
   uint64_t phaseCount[inspectorProxyWaitPhaseCount] = {0, 0, 0, 0, 0, 0};
   uint64_t phaseSumUsecs[inspectorProxyWaitPhaseCount] = {0, 0, 0, 0, 0, 0};
   uint64_t phaseMaxUsecs[inspectorProxyWaitPhaseCount] = {0, 0, 0, 0, 0, 0};
+  inspectorProxyPhasePeak phasePeaks[inspectorProxyWaitPhaseCount] = {};
   uint64_t missingTransitions = 0;
 };
 
@@ -219,7 +220,7 @@ struct inspectorPromDevice {
   uint64_t p2pOverwritten = 0;
   bool hasData = false;
 };
-static const int kInspectorPromFormatMinor = 6;
+static const int kInspectorPromFormatMinor = 7;
 static const size_t kInspectorPromPercentileSampleCapacity = 256;
 static const size_t kInspectorPromGlobalSlowEventCapacity = 4;
 static std::mutex gInspectorPromStreamingMutex;
@@ -434,6 +435,9 @@ inspectorResult_t inspectorPromRecordProxyOp(
     agg.phaseSumUsecs[phase] += op->phaseSumUsecs[phase];
     agg.phaseMaxUsecs[phase] = std::max(
       agg.phaseMaxUsecs[phase], op->phaseMaxUsecs[phase]);
+    if (enableNcclInspectorProxyPeak) {
+      inspectorProxySelectPeak(agg.phasePeaks[phase], op->phasePeaks[phase]);
+    }
   }
   if (devicePtr != nullptr) devicePtr->hasData = true;
   return inspectorSuccess;
@@ -1357,13 +1361,15 @@ static inspectorResult_t inspectorPromWriteStepProxy(
     "# nccl_inspector_step_proxy_info {\"records\":%zu,"
     "\"dropped_ops\":%" PRIu64 ",\"dropped_steps\":%" PRIu64
     ",\"detached_ops\":%" PRIu64
+    ",\"peak_schema\":1,\"peak_enabled\":%s"
     ",\"world_size\":%d,\"dp_size\":%d,\"edp_size\":%d"
     ",\"ep_size\":%d,\"pp_size\":%d"
     ",\"phase_fields\":[\"send_gpu_wait\",\"send_peer_wait\","
     "\"send_wait\",\"recv_wait\",\"recv_flush_wait\","
     "\"recv_gpu_wait\"]}\n",
     proxy.size(), inspectorProxyPoolDroppedOps(), inspectorProxyPoolDroppedSteps(),
-    inspectorProxyPoolDetachedOps(), sizes.world, sizes.dp, sizes.edp,
+    inspectorProxyPoolDetachedOps(), enableNcclInspectorProxyPeak ? "true" : "false",
+    sizes.world, sizes.dp, sizes.edp,
     sizes.ep, sizes.pp);
   if (infoWritten < 0 || (size_t)infoWritten >= sizeof(buffer)) {
     return inspectorMemoryError;
@@ -1406,6 +1412,38 @@ static inspectorResult_t inspectorPromWriteStepProxy(
     }
     if (fwrite(buffer, 1, written, file) != (size_t)written) {
       return inspectorFileOpenError;
+    }
+    if (enableNcclInspectorProxyPeak) {
+      for (int phase = 0; phase < inspectorProxyWaitPhaseCount; phase++) {
+        const auto& peak = agg.phasePeaks[phase];
+        if (peak.startUsecs == 0) continue;
+        int peakWritten = snprintf(
+          buffer, sizeof(buffer),
+          "# nccl_inspector_step_proxy_peak {\"schema\":1,\"step\":%" PRId64
+          ",\"family\":\"%s\",\"operation\":\"%s\",\"message_size_bytes\":%zu"
+          ",\"direction\":\"%s\",\"comm_id\":\"%s\",\"comm_rank\":%d"
+          ",\"nranks\":%d,\"n_nodes\":%d,\"phase\":\"%s\""
+          ",\"identity_known\":%s,\"parent_type\":%" PRIu64
+          ",\"sequence\":%" PRIu64 ",\"channel\":%d,\"peer\":%d"
+          ",\"transfer_step\":%d,\"start_us\":%" PRIu64
+          ",\"stop_us\":%" PRIu64 ",\"duration_us\":%" PRIu64
+          ",\"clock\":\"host_gettimeofday_us\",\"clock_alignment\":\"unverified\""
+          ",\"retention\":\"max_per_phase_per_aggregate\"}\n",
+          key.step, inspectorPromSemanticFamilyName(key.family),
+          ncclFuncToString(key.func), key.messageSizeBytes,
+          key.isSend ? "send" : "recv", key.commId.c_str(), key.commRank,
+          key.nranks, key.nnodes,
+          inspectorProxyWaitPhaseName(static_cast<inspectorProxyWaitPhase>(phase)),
+          peak.identityKnown ? "true" : "false", peak.parentType,
+          peak.sequence, peak.channel, peak.peer, peak.transferStep,
+          peak.startUsecs, peak.stopUsecs, peak.stopUsecs - peak.startUsecs);
+        if (peakWritten < 0 || (size_t)peakWritten >= sizeof(buffer)) {
+          return inspectorMemoryError;
+        }
+        if (fwrite(buffer, 1, peakWritten, file) != (size_t)peakWritten) {
+          return inspectorFileOpenError;
+        }
+      }
     }
   }
   return inspectorSuccess;
@@ -1860,6 +1898,7 @@ static void inspectorPromMergeStepProxyAgg(
     target.phaseSumUsecs[phase] += source.phaseSumUsecs[phase];
     target.phaseMaxUsecs[phase] = std::max(
       target.phaseMaxUsecs[phase], source.phaseMaxUsecs[phase]);
+    inspectorProxySelectPeak(target.phasePeaks[phase], source.phasePeaks[phase]);
   }
 }
 

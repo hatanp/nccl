@@ -344,3 +344,8 @@ The size of output files depends on the output format and usage patterns:
 
 - The plugin is compatible with standard NCCL workflows and can be used in both single-node and multi-node (SLURM) environments.
 - For more details, see the source code and comments in `plugins/profiler/inspector/`.
+
+## Exact proxy phase witnesses
+
+See [PROXY_PEAK_IDENTITY.md](PROXY_PEAK_IDENTITY.md) for the optional bounded
+identity-preserving phase maxima, clock semantics, and native qualification limits.
