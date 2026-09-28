@@ -107,7 +107,7 @@ static inline int ncclFuncTrafficPerByte(ncclFunc_t func, int nRanks) {
 
 ncclResult_t ncclAddProxyOpIfNeeded(struct ncclComm* comm, struct ncclKernelPlan* plan, struct ncclProxyOp* op) {
   bool needed = true;
-  NCCLCHECK(ncclProxySaveOp(comm, op, &needed));
+  NCCLCHECK(ncclProxySaveOp(comm, op, plan->persistent, &needed));
   if (needed) {
     struct ncclProxyOp* q = ncclMemoryPoolAlloc<struct ncclProxyOp>(&comm->memPool_ncclProxyOp, &comm->memPermanent);
     *q = *op; // C++ struct assignment
@@ -1419,7 +1419,7 @@ static ncclResult_t uploadProxyOps(struct ncclComm* comm, struct ncclKernelPlan*
       op->opCount = (collOpCount << 1) + oldId;
     }
 
-    NCCLCHECK(ncclProxySaveOp(comm, op, nullptr));
+    NCCLCHECK(ncclProxySaveOp(comm, op, plan->persistent, nullptr));
     op->opCount = oldId; // Restore for next uploadProxyOps()
     op = op->enqNext;
   }

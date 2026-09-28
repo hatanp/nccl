@@ -559,17 +559,18 @@ static void incWorkCounter(struct ncclComm* comm, struct ncclProxyOp* op) {
     (op->incWorkCounter) ? ++comm->profiler.workCounter[op->channelId] : comm->profiler.workCounter[op->channelId];
 }
 
-static ncclResult_t SaveProxyProfiler(struct ncclComm* comm, struct ncclProxyOp* op, bool* justInquire) {
+static ncclResult_t SaveProxyProfiler(struct ncclComm* comm, struct ncclProxyOp* op, bool persistent, bool* justInquire) {
   struct ncclProxyConnector* proxyConn = (op->coll == ncclFuncRecv) ? &comm->profiler.recvProxyConn[op->channelId] :
                                                                       &comm->profiler.sendProxyConn[op->channelId];
   if (justInquire) {
     *justInquire = true;
-    if (!comm->planner.persistent) incWorkCounter(comm, op);
+    if (!persistent) incWorkCounter(comm, op);
   } else {
     op->sendbuff = (uint8_t*)comm->profiler.workStarted;
     op->recvbuff = (uint8_t*)comm->profiler.workCompleted;
-    // Ensure that in graph capturing the proxy workCounter is incremented to keep up with kernel workCounter
-    if (comm->planner.persistent) incWorkCounter(comm, op);
+    // The captured plan outlives planner state, which a later eager call can change.
+    // Advance on each persistent-plan upload to keep up with the kernel workCounter.
+    if (persistent) incWorkCounter(comm, op);
     NCCLCHECK(ncclLocalOpAppend(comm, proxyConn, op));
   }
   return ncclSuccess;
@@ -599,7 +600,7 @@ static ncclResult_t SaveProxy(struct ncclComm* comm, struct ncclChannel* channel
 
 // justInquire != nullptr means don't actually do anything, just assertain need of
 // ncclProxySaveOp for this op.
-ncclResult_t ncclProxySaveOp(struct ncclComm* comm, struct ncclProxyOp* op, bool* justInquire) {
+ncclResult_t ncclProxySaveOp(struct ncclComm* comm, struct ncclProxyOp* op, bool persistent, bool* justInquire) {
   struct ncclChannel* channel = &comm->channels[op->channelId];
   bool needProxy = false;
   if (justInquire) *justInquire = false;
@@ -757,7 +758,7 @@ ncclResult_t ncclProxySaveOp(struct ncclComm* comm, struct ncclProxyOp* op, bool
     break;
   case ncclPatternProfiler:
     {
-      if (ncclProfilerNeedsProxy(comm, op)) NCCLCHECK(SaveProxyProfiler(comm, op, justInquire));
+      if (ncclProfilerNeedsProxy(comm, op)) NCCLCHECK(SaveProxyProfiler(comm, op, persistent, justInquire));
       else incWorkCounter(comm, op);
     }
     break;

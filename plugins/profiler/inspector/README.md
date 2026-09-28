@@ -349,3 +349,27 @@ The size of output files depends on the output format and usage patterns:
 
 See [PROXY_PEAK_IDENTITY.md](PROXY_PEAK_IDENTITY.md) for the optional bounded
 identity-preserving phase maxima, clock semantics, and native qualification limits.
+
+### Core profiler counter regression
+
+A captured plan can replay after an eager call changes the communicator's current
+planner state. The core profiler now carries the plan's immutable `persistent`
+flag through `ncclProxySaveOp`: eager operations advance their work counter during
+planning, while persistent operations advance on every upload/replay. It does not
+change transport algorithms, the profiler plugin ABI, or shared planner state.
+
+Run the portable extracted-source regression from this directory, placing all
+build artifacts outside the source checkout:
+
+```bash
+python3 tests/profiler_persistent_plan_test.py --build-dir /path/to/task-cache/profiler-plan-tests
+```
+
+The test covers graph-only, eager-only, same-communicator mixed replay, unrelated
+communicator activity, delayed eager upload, non-incrementing companions, and the
+disabled-profiler path. A negative control restores the old planner predicate and
+must fail the mixed-replay freshness check. This is host-side validation with a
+synthetic device producer, not CUDA qualification. A rebuilt core NCCL library
+and native replay qualification are still required. The patch does not address
+ring-overrun detection, sparse-channel summaries, host completion-step association,
+or repair previously collected timing records.
