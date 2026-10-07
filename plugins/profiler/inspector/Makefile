@@ -68,6 +68,8 @@ SRCS := inspector.cc \
 	inspector_cudawrap.cc \
 	inspector_ring.cc \
 	inspector_event_pool.cc \
+	inspector_proxy_pool.cc \
+	inspector_parent_identity.cc \
 	json.cc \
 	version.cc
 
@@ -77,9 +79,50 @@ OBJS := $(SRCS:%.cc=$(OBJDIR)/%.o)
 TARGET := libnccl-profiler-inspector.so
 
 # Build rules
-.PHONY: all clean help check-cuda
+.PHONY: all clean help check-cuda test-ring test-prom-stats test-proxy-stats test-proxy-pool test-proxy-lifecycle test-parent-identity
 
 all: check-cuda $(TARGET)
+
+test-ring:
+	$(CXX) $(CXXSTD) -Wall -Wextra $(INCLUDES) \
+		tests/inspector_ring_test.cc inspector_ring.cc -o inspector_ring_test
+	./inspector_ring_test
+	rm -f inspector_ring_test
+
+test-prom-stats:
+	$(CXX) $(CXXSTD) -Wall -Wextra $(INCLUDES) \
+		tests/inspector_prom_stats_test.cc -o inspector_prom_stats_test
+	./inspector_prom_stats_test
+	rm -f inspector_prom_stats_test
+
+test-proxy-stats:
+	$(CXX) $(CXXSTD) -Wall -Wextra $(INCLUDES) \
+		tests/inspector_proxy_stats_test.cc -o inspector_proxy_stats_test
+	./inspector_proxy_stats_test
+	rm -f inspector_proxy_stats_test
+
+test-proxy-pool:
+	$(CXX) $(CXXSTD) -Wall -Wextra $(INCLUDES) \
+		tests/inspector_proxy_pool_test.cc inspector_proxy_pool.cc -o inspector_proxy_pool_test
+	./inspector_proxy_pool_test
+	rm -f inspector_proxy_pool_test
+
+test-parent-identity:
+	$(CXX) $(CXXSTD) -Wall -Wextra -pthread $(INCLUDES) \
+		tests/inspector_parent_identity_test.cc inspector_parent_identity.cc -o inspector_parent_identity_test
+	./inspector_parent_identity_test
+	rm -f inspector_parent_identity_test
+
+test-proxy-lifecycle: all
+	$(CXX) $(CXXSTD) -Wall -Wextra $(INCLUDES) \
+		tests/inspector_proxy_lifecycle_test.cc -L. \
+		-Wl,-rpath,'$$ORIGIN' -lnccl-profiler-inspector -o inspector_proxy_lifecycle_test
+	./inspector_proxy_lifecycle_test
+	./inspector_proxy_lifecycle_test cap1
+	./inspector_proxy_lifecycle_test cap0
+	./inspector_proxy_lifecycle_test off
+	./inspector_proxy_lifecycle_test missing
+	rm -f inspector_proxy_lifecycle_test
 
 # Check that CUDA installation exists
 check-cuda:
@@ -147,6 +190,7 @@ help:
 	@echo "  all     - Build the inspector library (default)"
 	@echo "  clean   - Clean build artifacts"
 	@echo "  help    - Show this help"
+	@echo "  test-ring - Run the host-only completed-ring unit test"
 	@echo ""
 	@echo "Options:"
 	@echo "  DEBUG=1                      - Enable debug build"

@@ -16,9 +16,13 @@
 
 #include "json.h"
 #include "common.h"
+#include "inspector_proxy_stats.h"
+#include "inspector_parent_identity.h"
 #include "version.h"
 
 #define MAX_CHANNELS                     64
+#define NCCL_INSPECTOR_ALGO_NAME_MAX     32
+#define NCCL_INSPECTOR_PROTO_NAME_MAX    32
 
 // Bump when ncclProfiler_t alias changes to a new interface version.
 #define NCCL_PROFILER_INTERFACE_VERSION 5
@@ -148,11 +152,13 @@ struct inspectorCompletedOpInfo {
   uint64_t timestampUsec;
   size_t msgSizeBytes;
   uint64_t execTimeUsecs;
+  uint64_t gpuStartNanosecs;
+  uint64_t gpuStopNanosecs;
   inspectorTimingSource_t timingSource;
   double algoBwGbs;
   double busBwGbs;
-  const char* algo;   // coll only (nullptr for P2P)
-  const char* proto;  // coll only (nullptr for P2P)
+  char algo[NCCL_INSPECTOR_ALGO_NAME_MAX];   // coll only
+  char proto[NCCL_INSPECTOR_PROTO_NAME_MAX]; // coll only
   int peer;           // P2P only (unused for coll)
   struct inspectorEventTrkOpInfo evtTrk;
 };
@@ -236,8 +242,51 @@ struct inspectorKernelChInfo {
   uint64_t stopGpuClk;
 };
 
+struct inspectorProxyOpInfo {
+  uint64_t type;
+  uint64_t parentIdentityId;
+  struct inspectorCommInfo* commInfo;
+  uint64_t parentType;
+  void* parentObj;
+  int detached;
+  ncclFunc_t func;
+  uint64_t sequence;
+  size_t messageSizeBytes;
+  int peer;
+  int rank;
+  int nranks;
+  int nnodes;
+  uint8_t channelId;
+  int isSend;
+  int64_t applicationStep;
+  char algo[NCCL_INSPECTOR_ALGO_NAME_MAX];
+  char proto[NCCL_INSPECTOR_PROTO_NAME_MAX];
+  uint64_t proxyStepCount;
+  uint64_t transferSizeBytes;
+  uint64_t unknownTransferSizes;
+  uint64_t phaseCount[inspectorProxyWaitPhaseCount];
+  uint64_t phaseSumUsecs[inspectorProxyWaitPhaseCount];
+  uint64_t phaseMaxUsecs[inspectorProxyWaitPhaseCount];
+  inspectorProxyPhasePeak phasePeaks[inspectorProxyWaitPhaseCount];
+  uint64_t missingTransitions;
+};
+
+struct inspectorProxyStepInfo {
+  uint64_t type;
+  struct inspectorProxyOpInfo* parent;
+  int transferStep;
+  int64_t applicationStep;
+  bool isSend;
+  uint64_t startUsecs;
+  uint64_t stopUsecs;
+  uint64_t stateUsecs[3];
+  size_t transferSizeBytes;
+  uint64_t unknownTransferSizes;
+};
+
 struct inspectorCollInfo {
   uint64_t type;
+  inspectorParentIdentity parentIdentity;
   int refCount;
   struct inspectorCommInfo *commInfo;
   const char* func;
@@ -325,6 +374,9 @@ inline int ncclTypeSize(ncclDataType_t type) {
 
 // Global flag to control P2P tracking
 extern bool enableNcclInspectorP2p;
+extern bool enableNcclInspectorProxyStep;
+extern bool enableNcclInspectorProxyPeak;
+extern bool enableNcclInspectorParentIdentity;
 extern bool requireKernelTiming;
 // Minimum message size (bytes) to be `tracked by inspector
 extern size_t ncclInspectorDumpMinSizeBytes;

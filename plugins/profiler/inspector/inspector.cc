@@ -15,6 +15,7 @@
 #include "inspector_event_pool.h"
 
 #include <assert.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <strings.h>
@@ -49,6 +50,8 @@ static bool enableNcclInspectorDumpVerbose = false;
 // Global flag to control prometheus format dumping
 static bool enableNcclInspectorPromDump = false;
 static bool warnedOtelPromDumpConflict = false;
+// Preserve compact Prometheus summaries after process teardown.
+static bool retainNcclInspectorPromDump = false;
 // Per-communicator completed-collective ring buffer capacity
 static uint32_t ncclInspectorDumpCollRingSize = 1024;
 // Per-communicator completed-P2P ring buffer capacity
@@ -62,6 +65,14 @@ static int64_t ncclInspectorDumpIntervalUsecs = -1;
 static bool ncclInspectorInit = false;
 // Global flag to control P2P tracking
 bool enableNcclInspectorP2p = true;
+bool enableNcclInspectorProxyStep = false;
+bool enableNcclInspectorProxyPeak = false;
+bool enableNcclInspectorParentIdentity = false;
+
+bool inspectorPromStreamingEnabled() {
+  return enableNcclInspectorPromDump && retainNcclInspectorPromDump
+    && !enableNcclInspectorDumpThread;
+}
 // Global flag: require kernel-based timing; discard events without it
 bool requireKernelTiming = true;
 bool inspectorIsDumpVerboseEnabled() {
@@ -507,15 +518,19 @@ inspectorDumpThread::~inspectorDumpThread() {
       }
     }
 
-    // Cleanup (delete) prom files after closing them
-    for (size_t i = 0; i < deviceFlushEntries.size(); i++) {
-      if (deviceFlushEntries[i].filename[0] != '\0') {
-        if (unlink(deviceFlushEntries[i].filename) == 0) {
-          TRACE_INSPECTOR("NCCL Inspector: Cleaned up Prometheus file %s",
-                          deviceFlushEntries[i].filename);
-        } else {
-          INFO_INSPECTOR("NCCL Inspector: Failed to cleanup Prometheus file %s: %s",
-                         deviceFlushEntries[i].filename, strerror(errno));
+    // The default preserves the node-exporter workflow, where files are
+    // temporary. Diagnostic jobs can opt into retaining the final compact
+    // summaries as durable result artifacts.
+    if (!retainNcclInspectorPromDump) {
+      for (size_t i = 0; i < deviceFlushEntries.size(); i++) {
+        if (deviceFlushEntries[i].filename[0] != '\0') {
+          if (unlink(deviceFlushEntries[i].filename) == 0) {
+            TRACE_INSPECTOR("NCCL Inspector: Cleaned up Prometheus file %s",
+                            deviceFlushEntries[i].filename);
+          } else {
+            INFO_INSPECTOR("NCCL Inspector: Failed to cleanup Prometheus file %s: %s",
+                           deviceFlushEntries[i].filename, strerror(errno));
+          }
         }
       }
     }
@@ -682,9 +697,11 @@ inspectorResult_t inspectorDumpThread::inspectorStateDumpJSON(const char* output
 inspectorResult_t inspectorDumpThread::inspectorStateDumpProm(const char* output_root) {
   // Write communicators directly to files with per-device flushing
   // handled inside
-  inspectorResult_t dumpResult = inspectorPromCommInfoListDump(&g_state.liveComms,
-                                                               output_root,
-                                                               this);
+  inspectorResult_t dumpResult
+    = inspectorPromCommInfoListsDump(&g_state.liveComms,
+                                     &g_state.deletedComms,
+                                     output_root,
+                                     this);
   if (dumpResult != inspectorSuccess) {
     INFO_INSPECTOR("NCCL Inspector: Direct Prometheus dump failed: %s",
                    inspectorErrorString(dumpResult));
@@ -854,6 +871,12 @@ static void showInspectorEnvVars() {
   } envVars[] = {
     {"NCCL_INSPECTOR_ENABLE", getenv("NCCL_INSPECTOR_ENABLE"), "0", "Enable/disable inspector plugin"},
     {"NCCL_INSPECTOR_ENABLE_P2P", getenv("NCCL_INSPECTOR_ENABLE_P2P"), "1", "Enable/disable P2P tracking"},
+    {"NCCL_INSPECTOR_PROXY_STEP_ENABLE", getenv("NCCL_INSPECTOR_PROXY_STEP_ENABLE"), "0", "Enable bounded proxy operation/step wait-state tracking"},
+    {"NCCL_INSPECTOR_PROXY_PEAK_ENABLE", getenv("NCCL_INSPECTOR_PROXY_PEAK_ENABLE"), "0", "Retain exact identity and host interval for each proxy phase maximum"},
+    {"NCCL_INSPECTOR_PARENT_IDENTITY_ENABLE", getenv("NCCL_INSPECTOR_PARENT_IDENTITY_ENABLE"), "0", "Opt in to local collective parent descriptors for retained proxy peaks"},
+    {"NCCL_INSPECTOR_PARENT_DICTIONARY_CAPACITY", getenv("NCCL_INSPECTOR_PARENT_DICTIONARY_CAPACITY"), "4096", "Dump-time parent dictionary cap (0 disables, maximum 65536)"},
+    {"NCCL_INSPECTOR_PROXY_OP_POOL_SIZE", getenv("NCCL_INSPECTOR_PROXY_OP_POOL_SIZE"), "8192", "Fixed proxy operation pool capacity"},
+    {"NCCL_INSPECTOR_PROXY_STEP_POOL_SIZE", getenv("NCCL_INSPECTOR_PROXY_STEP_POOL_SIZE"), "32768", "Fixed proxy step pool capacity"},
     {"NCCL_INSPECTOR_DUMP_THREAD_ENABLE", getenv("NCCL_INSPECTOR_DUMP_THREAD_ENABLE"), "1", "Enable/disable dump thread"},
     {"NCCL_INSPECTOR_DUMP_THREAD_INTERVAL_MICROSECONDS", getenv("NCCL_INSPECTOR_DUMP_THREAD_INTERVAL_MICROSECONDS"), "-1", "Dump interval in microseconds (-1 = disabled/dump only at teardown, 0 = continuous, >0 = periodic)"},
     {"NCCL_INSPECTOR_DUMP_DIR", getenv("NCCL_INSPECTOR_DUMP_DIR"), "(auto-generated)", "Output directory for inspector logs"},
@@ -867,6 +890,7 @@ static void showInspectorEnvVars() {
     {"OTEL_EXPORTER_OTLP_TIMEOUT", getenv("OTEL_EXPORTER_OTLP_TIMEOUT"), "(unset)", "OTLP HTTP export timeout fallback in milliseconds"},
     {"OTEL_SERVICE_NAME", getenv("OTEL_SERVICE_NAME"), "nccl-inspector", "OTLP service.name resource attribute"},
     {"OTEL_RESOURCE_ATTRIBUTES", getenv("OTEL_RESOURCE_ATTRIBUTES"), "(unset)", "OTLP resource attributes"},
+    {"NCCL_INSPECTOR_PROM_RETAIN", getenv("NCCL_INSPECTOR_PROM_RETAIN"), "0", "Retain Prometheus summary files after teardown"},
     {"NCCL_INSPECTOR_DUMP_MIN_SIZE_BYTES", getenv("NCCL_INSPECTOR_DUMP_MIN_SIZE_BYTES"), "8192", "Minimum message size (bytes) to be tracked by inspector"},
     {"NCCL_INSPECTOR_DUMP_COLL_RING_SIZE", getenv("NCCL_INSPECTOR_DUMP_COLL_RING_SIZE"), "1024", "Per-communicator completed-collective ring buffer capacity"},
     {"NCCL_INSPECTOR_DUMP_P2P_RING_SIZE", getenv("NCCL_INSPECTOR_DUMP_P2P_RING_SIZE"), "1024", "Per-communicator completed-P2P ring buffer capacity"},
@@ -961,6 +985,17 @@ static void initP2pTrackingFromEnv() {
   enableNcclInspectorP2p = enable == 0 ? false : true;
 }
 
+static void initProxyStepTrackingFromEnv() {
+  const char* str = getenv("NCCL_INSPECTOR_PROXY_STEP_ENABLE");
+  int enable = str ? atoi(str) : 0;
+  enableNcclInspectorProxyStep = enable != 0;
+  const char* peak = getenv("NCCL_INSPECTOR_PROXY_PEAK_ENABLE");
+  enableNcclInspectorProxyPeak = enableNcclInspectorProxyStep && peak && atoi(peak) != 0;
+  const char* parent = getenv("NCCL_INSPECTOR_PARENT_IDENTITY_ENABLE");
+  enableNcclInspectorParentIdentity = enableNcclInspectorProxyPeak
+    && parent && atoi(parent) != 0;
+}
+
 /*
  * Description:
  *
@@ -1027,6 +1062,10 @@ static inspectorResult_t initDumpThreadFromEnv() {
 
   inspectorOtelInitFromEnv();
 
+  str = getenv("NCCL_INSPECTOR_PROM_RETAIN");
+  enable = str ? atoi(str) : 0;
+  retainNcclInspectorPromDump = enable == 0 ? false : true;
+
   str = getenv("NCCL_INSPECTOR_DUMP_THREAD_INTERVAL_MICROSECONDS");
   if (str) {
     ncclInspectorDumpIntervalUsecs = strtoll(str, 0, 0);
@@ -1049,8 +1088,22 @@ static inspectorResult_t initDumpThreadFromEnv() {
   ncclInspectorDumpP2pRingSize
     = getRingSizeFromEnv("NCCL_INSPECTOR_DUMP_P2P_RING_SIZE", 1024);
 
-  if (enableNcclInspectorDumpThread) {
+  if (enableNcclInspectorDumpThread && ncclInspectorDumpIntervalUsecs >= 0) {
     INS_CHK(inspectorStartDumpThread(ncclInspectorDumpIntervalUsecs));
+  } else if (enableNcclInspectorPromDump) {
+    // Final-only compact mode: retain completed operations in the configured
+    // rings and create a dumper without a background thread. Finalization
+    // performs the single output pass.
+    char* dumpdir;
+    genDumpDir(&dumpdir);
+    if (dumpdir != nullptr) {
+      if (ensureDir(dumpdir)) {
+        dumper = new inspectorDumpThread(dumpdir, -1);
+      } else {
+        INFO_INSPECTOR("NCCL Inspector: failed to generate compact dump dir");
+      }
+      free(dumpdir);
+    }
   } else {
     INFO_INSPECTOR(
       "NCCL Inspector: NCCL_INSPECTOR_DUMP_THREAD_ENABLE set to 0; not "
@@ -1107,6 +1160,7 @@ inspectorResult_t inspectorGlobalInit(int rank) {
 
   INS_CHK(inspectorGlobalStateInit());
   initP2pTrackingFromEnv();
+  initProxyStepTrackingFromEnv();
   initKernelTimingFromEnv();
   INS_CHK(inspectorEventPoolInitFromEnv());
   INS_CHK(initDumpThreadFromEnv());
@@ -1191,7 +1245,7 @@ const char* inspectorErrorString(inspectorResult_t result) {
  */
 inspectorResult_t inspectorCommGetHashStr(uint64_t commHash,
                                           char hashStr[NCCL_COMM_HASH_LENGTH]) {
-  snprintf(hashStr, NCCL_COMM_HASH_LENGTH, "0x%lx",
+  snprintf(hashStr, NCCL_COMM_HASH_LENGTH, "0x%" PRIx64,
            commHash);
   return inspectorSuccess;
 }
@@ -1263,9 +1317,13 @@ static inspectorResult_t inspectorFillCommInfo(struct inspectorCommInfo* commInf
   commInfo->dump_coll = false;
   commInfo->dump_p2p = false;
   commInfo->p2pSeqNum = 0;
-  INS_CHK(inspectorRingInit(&commInfo->completedCollRing, ncclInspectorDumpCollRingSize,
+  uint32_t collRingSize
+    = inspectorPromStreamingEnabled() ? 1 : ncclInspectorDumpCollRingSize;
+  uint32_t p2pRingSize
+    = inspectorPromStreamingEnabled() ? 1 : ncclInspectorDumpP2pRingSize;
+  INS_CHK(inspectorRingInit(&commInfo->completedCollRing, collRingSize,
                             sizeof(struct inspectorCompletedOpInfo)));
-  INS_CHK(inspectorRingInit(&commInfo->completedP2pRing, ncclInspectorDumpP2pRingSize,
+  INS_CHK(inspectorRingInit(&commInfo->completedP2pRing, p2pRingSize,
                             sizeof(struct inspectorCompletedOpInfo)));
 
   // Capture current CUDA device ID and convert to UUID string
@@ -1562,6 +1620,25 @@ static uint64_t calculateKernelGpuExecTimeUsecs(struct inspectorKernelChInfo *ke
   return 0;
 }
 
+static void calculateKernelGpuEnvelopeNanosecs(
+    struct inspectorKernelChInfo* kernelChannels,
+    uint32_t nChannels,
+    uint64_t* startNanosecs,
+    uint64_t* stopNanosecs) {
+  *startNanosecs = 0;
+  *stopNanosecs = 0;
+  for (uint32_t i = 0; i < nChannels; i++) {
+    const struct inspectorKernelChInfo* kernelCh = &kernelChannels[i];
+    if (kernelCh->startGpuClk == 0 || kernelCh->stopGpuClk <= kernelCh->startGpuClk) {
+      continue;
+    }
+    if (*startNanosecs == 0 || kernelCh->startGpuClk < *startNanosecs) {
+      *startNanosecs = kernelCh->startGpuClk;
+    }
+    *stopNanosecs = std::max(*stopNanosecs, kernelCh->stopGpuClk);
+  }
+}
+
 /*
  * Description:
  *
@@ -1650,8 +1727,13 @@ void inspectorUpdateCollPerf(struct inspectorCompletedOpInfo *completedOp,
   completedOp->msgSizeBytes = collInfo->msgSizeBytes;
   completedOp->execTimeUsecs =
     calculateMaxKernelExecTimeUsecs(collInfo, &completedOp->timingSource);
-  completedOp->algo = collInfo->algo;
-  completedOp->proto = collInfo->proto;
+  calculateKernelGpuEnvelopeNanosecs(
+    collInfo->kernelCh, collInfo->nChannels,
+    &completedOp->gpuStartNanosecs, &completedOp->gpuStopNanosecs);
+  snprintf(completedOp->algo, sizeof(completedOp->algo), "%s",
+           collInfo->algo ? collInfo->algo : "unknown");
+  snprintf(completedOp->proto, sizeof(completedOp->proto), "%s",
+           collInfo->proto ? collInfo->proto : "unknown");
   completedOp->evtTrk = collInfo->collEvtTrk;
 }
 
@@ -1734,6 +1816,9 @@ void inspectorUpdateP2pPerf(struct inspectorCompletedOpInfo *completedOp,
   completedOp->peer = p2pInfo->peer;
   completedOp->execTimeUsecs =
     calculateMaxKernelExecTimeUsecsP2p(p2pInfo, &completedOp->timingSource);
+  calculateKernelGpuEnvelopeNanosecs(
+    p2pInfo->kernelCh, p2pInfo->nChannels,
+    &completedOp->gpuStartNanosecs, &completedOp->gpuStopNanosecs);
   completedOp->evtTrk = p2pInfo->p2pEvtTrk;
 }
 
@@ -1761,6 +1846,13 @@ inspectorResult_t inspectorGlobalFinalize() {
   inspectorCudaWrapCleanup();
   if (dumper) {
     dumper->stopThread();
+    // Capture operations completed since the last periodic dump, or the whole
+    // diagnostic window when the dump thread was disabled.
+    inspectorResult_t dumpResult = dumper->inspectorStateDump(dumper->outputRoot);
+    if (dumpResult != inspectorSuccess) {
+      INFO_INSPECTOR("NCCL Inspector: final dump failed: %s",
+                     inspectorErrorString(dumpResult));
+    }
     delete dumper;
     dumper = nullptr;
   }

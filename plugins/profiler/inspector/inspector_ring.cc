@@ -26,6 +26,7 @@ inspectorResult_t inspectorRingInit(struct inspectorCompletedRing* ring,
                                     size_t entrySize) {
   if (!ring) return inspectorMemoryError;
   ring->entrySize = entrySize;
+  ring->overwritten = 0;
   if (size == 0) {
     ring->entries = nullptr;
     ring->size = ring->head = ring->tail = 0;
@@ -64,6 +65,7 @@ void inspectorRingFinalize(struct inspectorCompletedRing* ring) {
   free(ring->entries);
   ring->entries = nullptr;
   ring->size = ring->head = ring->tail = 0;
+  ring->overwritten = 0;
 }
 
 /*
@@ -93,6 +95,7 @@ inspectorResult_t inspectorRingEnqueue(struct inspectorCompletedRing* ring,
   if ((ring->tail + 1) % bufSize == ring->head) {
     // Ring is full: advance head to overwrite the oldest entry
     ring->head = (ring->head + 1) % bufSize;
+    ring->overwritten++;
   }
 
   memcpy(ringSlot(ring, ring->tail), entry, ring->entrySize);
