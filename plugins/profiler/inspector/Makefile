@@ -79,7 +79,7 @@ OBJS := $(SRCS:%.cc=$(OBJDIR)/%.o)
 TARGET := libnccl-profiler-inspector.so
 
 # Build rules
-.PHONY: all clean help check-cuda test-ring test-prom-stats test-proxy-stats test-proxy-pool test-proxy-lifecycle test-parent-identity test-thread-name
+.PHONY: all clean help check-cuda test-ring test-prom-stats test-proxy-stats test-proxy-pool test-proxy-lifecycle test-parent-identity test-thread-name test-event-pool test-proxy-late-parent
 
 all: check-cuda $(TARGET)
 
@@ -113,11 +113,25 @@ test-parent-identity:
 	./inspector_parent_identity_test
 	rm -f inspector_parent_identity_test
 
+test-event-pool:
+	$(CXX) $(CXXSTD) -Wall -Wextra -pthread $(INCLUDES) \
+		tests/inspector_event_pool_test.cc inspector_event_pool.cc -o inspector_event_pool_test
+	./inspector_event_pool_test
+	rm -f inspector_event_pool_test
+
 test-thread-name:
 	$(CXX) $(CXXSTD) -Wall -Wextra -pthread $(INCLUDES) \
 		tests/inspector_thread_name_test.cc -o inspector_thread_name_test
 	./inspector_thread_name_test
 	rm -f inspector_thread_name_test
+
+test-proxy-late-parent: all
+	$(CXX) $(CXXSTD) -Wall -Wextra $(INCLUDES) \
+		tests/inspector_proxy_late_parent_test.cc -L. \
+		-Wl,-rpath,'$$ORIGIN' -lnccl-profiler-inspector -o inspector_proxy_late_parent_test
+	./inspector_proxy_late_parent_test late
+	./inspector_proxy_late_parent_test expired
+	rm -f inspector_proxy_late_parent_test
 
 test-proxy-lifecycle: all
 	$(CXX) $(CXXSTD) -Wall -Wextra $(INCLUDES) \
@@ -198,6 +212,8 @@ help:
 	@echo "  help    - Show this help"
 	@echo "  test-ring - Run the host-only completed-ring unit test"
 	@echo "  test-thread-name - Run the profiler-thread naming unit test"
+	@echo "  test-event-pool - Run the record quarantine unit test"
+	@echo "  test-proxy-late-parent - Run the late proxy parent test (NCCL 2.31 order; builds the library)"
 	@echo ""
 	@echo "Options:"
 	@echo "  DEBUG=1                      - Enable debug build"

@@ -176,9 +176,9 @@ int main(int argc, char** argv) {
   assert(ncclProfiler_v5.stopEvent(detachedProxyStepHandle) == ncclSuccess);
   assert(ncclProfiler_v5.stopEvent(detachedProxyOpHandle) == ncclSuccess);
 
-  // The proxy operation must retain its local collective parent even after
-  // NCCL stops the task event. Force a pool allocation between parent stop
-  // and proxy stop so a missing proxy reference deterministically reuses it.
+  // The proxy operation copied its parent at start and holds no reference.
+  // The released parent stays in the pool's quarantine, so this allocation
+  // gets another record and the proxy's identity cannot change under it.
   assert(ncclProfiler_v5.stopEvent(collHandle) == ncclSuccess);
   ncclProfilerEventDescr_t replacementColl = coll;
   replacementColl.coll.seqNumber = 1; // Same function/sequence/count, different buffers.
@@ -264,7 +264,8 @@ int main(int argc, char** argv) {
   assert(ncclProfiler_v5.startEvent(
            context, &ambiguousCollHandle, &ambiguousColl) == ncclSuccess);
   assert(ambiguousCollHandle != nullptr);
-  assert(ambiguousCollHandle == replacementCollHandle); // Free-list address reused.
+  // Both released records are still quarantined (default 1,000 ms).
+  assert(ambiguousCollHandle != replacementCollHandle && ambiguousCollHandle != collHandle);
   if (parentEnabled) {
     assert(static_cast<inspectorCollInfo*>(ambiguousCollHandle)->parentIdentity.id > secondParentId);
   }
@@ -275,13 +276,16 @@ int main(int argc, char** argv) {
   assert(ncclProfiler_v5.startEvent(
            context, &ambiguousKernelHandle, &ambiguousKernel) == ncclSuccess);
   assert(ambiguousKernelHandle != nullptr);
+  assert(static_cast<inspectorCollInfo*>(ambiguousCollHandle)->applicationStep == 7);
+  // NCCL 2.31 delivers kernel completions from its profiler thread, which can
+  // run after the application closed the step: the row must stay in step 7.
+  assert(ncclInspectorStepEnd(7, 0) == 0);
   kernelStateArgs.kernelCh.pTimer = 4000000;
   assert(ncclProfiler_v5.recordEventState(
            ambiguousKernelHandle, ncclProfilerKernelChStop, &kernelStateArgs)
          == ncclSuccess);
   assert(ncclProfiler_v5.stopEvent(ambiguousKernelHandle) == ncclSuccess);
   assert(ncclProfiler_v5.stopEvent(ambiguousCollHandle) == ncclSuccess);
-  assert(ncclInspectorStepEnd(7, 0) == 0);
   assert(ncclProfiler_v5.finalize(context) == ncclSuccess);
 
   std::string path = findPromFile(outputDirectory);
@@ -301,6 +305,10 @@ int main(int argc, char** argv) {
   assert(output.find("\"dropped_ops\":0") != std::string::npos);
   assert(output.find("\"dropped_steps\":0") != std::string::npos);
   assert(output.find("\"detached_ops\":1") != std::string::npos);
+  // Every local proxy operation here starts while its parent is live (2.30 order).
+  assert(output.find("\"parent_late_ops\":0,") != std::string::npos);
+  assert(output.find("\"parent_expired_ops\":0,") != std::string::npos);
+  assert(output.find("\"pool_quarantine_ms\":1000,") != std::string::npos);
   assert(output.find("\"world_size\":256") != std::string::npos);
   assert(output.find("\"dp_size\":64") != std::string::npos);
   assert(output.find("\"edp_size\":2") != std::string::npos);

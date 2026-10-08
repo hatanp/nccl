@@ -1,9 +1,85 @@
 #include "inspector_event_pool.h"
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 // Global event pool
 struct inspectorEventPool g_eventPool;
+
+static uint64_t inspectorPoolMonotonicUsecs() {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return static_cast<uint64_t>(ts.tv_sec) * 1000000ull
+    + static_cast<uint64_t>(ts.tv_nsec) / 1000ull;
+}
+
+static uint64_t (*gPoolNowUsecs)() = inspectorPoolMonotonicUsecs;
+
+void inspectorEventPoolSetClock(uint64_t (*nowUsecs)()) {
+  gPoolNowUsecs = nowUsecs ? nowUsecs : inspectorPoolMonotonicUsecs;
+}
+
+// Quarantine helpers, shared by the collective and P2P pools. Callers hold the
+// pool lock. Released entries keep their contents until they leave the FIFO.
+template <typename Entry>
+static void poolReleaseExpired(Entry*& head, Entry*& tail, Entry*& freeList) {
+  if (head == nullptr) return;
+  const uint64_t now = gPoolNowUsecs();
+  while (head != nullptr && now >= head->releasedUsecs
+         && now - head->releasedUsecs >= g_eventPool.quarantineUsecs) {
+    Entry* entry = head;
+    head = entry->next;
+    if (head == nullptr) tail = nullptr;
+    entry->quarantined = false;
+    entry->next = freeList;
+    freeList = entry;
+  }
+}
+
+// Pool exhausted with growth disabled: reuse the oldest quarantined entry.
+template <typename Entry>
+static bool poolEvictOldest(Entry*& head, Entry*& tail, Entry*& freeList,
+                            uint64_t& evictions) {
+  if (head == nullptr) return false;
+  Entry* entry = head;
+  head = entry->next;
+  if (head == nullptr) tail = nullptr;
+  entry->quarantined = false;
+  entry->next = freeList;
+  freeList = entry;
+  evictions++;
+  return true;
+}
+
+template <typename Entry>
+static void poolReleaseEntry(Entry* entry, Entry*& head, Entry*& tail, Entry*& freeList) {
+  entry->inUse = false;
+  if (g_eventPool.quarantineUsecs == 0) {
+    entry->next = freeList;
+    freeList = entry;
+    return;
+  }
+  entry->quarantined = true;
+  entry->releasedUsecs = gPoolNowUsecs();
+  entry->next = nullptr;
+  if (tail != nullptr) tail->next = entry;
+  else head = entry;
+  tail = entry;
+}
+
+template <typename Entry>
+static inspectorPoolRecordState poolRecordState(const Entry* entry, uint64_t* releasedAgeUsecs) {
+  if (entry->inUse) return inspectorPoolRecordLive;
+  if (entry->quarantined) {
+    const uint64_t now = gPoolNowUsecs();
+    const uint64_t age = now >= entry->releasedUsecs ? now - entry->releasedUsecs : 0;
+    if (age < g_eventPool.quarantineUsecs) {
+      *releasedAgeUsecs = age;
+      return inspectorPoolRecordQuarantined;
+    }
+  }
+  return inspectorPoolRecordExpired;
+}
 
 /*
  * Description:
@@ -407,6 +483,10 @@ inspectorResult_t inspectorEventPoolInit(uint32_t collPoolSize,
 
   const char* growStr = getenv("NCCL_INSPECTOR_POOL_GROW");
   g_eventPool.growEnabled = growStr ? (atoi(growStr) != 0) : true;
+  const char* quarantineStr = getenv("NCCL_INSPECTOR_POOL_QUARANTINE_MS");
+  long quarantineMs = quarantineStr ? strtol(quarantineStr, nullptr, 10) : 1000;
+  if (quarantineMs < 0) quarantineMs = 0;
+  g_eventPool.quarantineUsecs = static_cast<uint64_t>(quarantineMs) * 1000ull;
 
   res = initCollectivePool(collPoolSize);
   if (res != inspectorSuccess) {
@@ -427,8 +507,9 @@ inspectorResult_t inspectorEventPoolInit(uint32_t collPoolSize,
   }
 
   INFO_INSPECTOR(
-    "NCCL Inspector: Memory pools initialized (stride-based) - Coll: %u, P2P: %u, Comms: %u, pool grow: %s",
-    collPoolSize, p2pPoolSize, commPoolSize, g_eventPool.growEnabled ? "enabled" : "disabled");
+    "NCCL Inspector: Memory pools initialized (stride-based) - Coll: %u, P2P: %u, Comms: %u, pool grow: %s, quarantine: %ld ms",
+    collPoolSize, p2pPoolSize, commPoolSize, g_eventPool.growEnabled ? "enabled" : "disabled",
+    quarantineMs);
 
   return inspectorSuccess;
 }
@@ -464,14 +545,19 @@ inspectorResult_t inspectorEventPoolFinalize() {
  */
 struct inspectorCollInfo* inspectorEventPoolAllocColl() {
   pthread_mutex_lock(&g_eventPool.collPoolLock);
+  poolReleaseExpired(g_eventPool.collQuarantineHead, g_eventPool.collQuarantineTail,
+                     g_eventPool.collFreeList);
 
   // If free list is empty, try to grow the pool
-  if (g_eventPool.collFreeList == nullptr) {
-    if (!g_eventPool.growEnabled) {
+  if (g_eventPool.collFreeList == nullptr && !g_eventPool.growEnabled) {
+    if (!poolEvictOldest(g_eventPool.collQuarantineHead, g_eventPool.collQuarantineTail,
+                         g_eventPool.collFreeList, g_eventPool.collQuarantineEvictions)) {
       pthread_mutex_unlock(&g_eventPool.collPoolLock);
       WARN_INSPECTOR("NCCL Inspector: Collective pool exhausted and pool grow is disabled (NCCL_INSPECTOR_POOL_GROW=0) - allocation failed!");
       return nullptr;
     }
+  }
+  if (g_eventPool.collFreeList == nullptr) {
     INFO_INSPECTOR(
       "NCCL Inspector: Collective pool exhausted, growing pool (current: %u chunks, %u entries)",
       g_eventPool.collChunkCount, g_eventPool.collTotalSize);
@@ -487,6 +573,7 @@ struct inspectorCollInfo* inspectorEventPoolAllocColl() {
   struct inspectorCollInfoPoolEntry* entry = g_eventPool.collFreeList;
   g_eventPool.collFreeList = entry->next;
   entry->inUse = true;
+  entry->quarantined = false;
   entry->next = nullptr;
   g_eventPool.collAllocCount++;
 
@@ -513,14 +600,19 @@ struct inspectorCollInfo* inspectorEventPoolAllocColl() {
  */
 struct inspectorP2pInfo* inspectorEventPoolAllocP2p() {
   pthread_mutex_lock(&g_eventPool.p2pPoolLock);
+  poolReleaseExpired(g_eventPool.p2pQuarantineHead, g_eventPool.p2pQuarantineTail,
+                     g_eventPool.p2pFreeList);
 
   // If free list is empty, try to grow the pool
-  if (g_eventPool.p2pFreeList == nullptr) {
-    if (!g_eventPool.growEnabled) {
+  if (g_eventPool.p2pFreeList == nullptr && !g_eventPool.growEnabled) {
+    if (!poolEvictOldest(g_eventPool.p2pQuarantineHead, g_eventPool.p2pQuarantineTail,
+                         g_eventPool.p2pFreeList, g_eventPool.p2pQuarantineEvictions)) {
       pthread_mutex_unlock(&g_eventPool.p2pPoolLock);
       WARN_INSPECTOR("NCCL Inspector: P2P pool exhausted and pool grow is disabled (NCCL_INSPECTOR_POOL_GROW=0) - allocation failed!");
       return nullptr;
     }
+  }
+  if (g_eventPool.p2pFreeList == nullptr) {
     INFO_INSPECTOR( "NCCL Inspector: P2P pool exhausted, growing pool (current: %u chunks, %u entries)",
                     g_eventPool.p2pChunkCount, g_eventPool.p2pTotalSize);
 
@@ -535,6 +627,7 @@ struct inspectorP2pInfo* inspectorEventPoolAllocP2p() {
   struct inspectorP2pInfoPoolEntry* entry = g_eventPool.p2pFreeList;
   g_eventPool.p2pFreeList = entry->next;
   entry->inUse = true;
+  entry->quarantined = false;
   entry->next = nullptr;
   g_eventPool.p2pAllocCount++;
 
@@ -631,9 +724,8 @@ void inspectorEventPoolReleaseColl(struct inspectorCollInfo* collInfo) {
     return;
   }
 
-  entry->inUse = false;
-  entry->next = g_eventPool.collFreeList;
-  g_eventPool.collFreeList = entry;
+  poolReleaseEntry(entry, g_eventPool.collQuarantineHead, g_eventPool.collQuarantineTail,
+                   g_eventPool.collFreeList);
   g_eventPool.collAllocCount--;
 
   pthread_mutex_unlock(&g_eventPool.collPoolLock);
@@ -674,9 +766,8 @@ void inspectorEventPoolReleaseP2p(struct inspectorP2pInfo* p2pInfo) {
     return;
   }
 
-  entry->inUse = false;
-  entry->next = g_eventPool.p2pFreeList;
-  g_eventPool.p2pFreeList = entry;
+  poolReleaseEntry(entry, g_eventPool.p2pQuarantineHead, g_eventPool.p2pQuarantineTail,
+                   g_eventPool.p2pFreeList);
   g_eventPool.p2pAllocCount--;
 
   pthread_mutex_unlock(&g_eventPool.p2pPoolLock);
@@ -723,4 +814,83 @@ void inspectorEventPoolReleaseComm(struct inspectorCommInfo* commInfo) {
   g_eventPool.commAllocCount--;
 
   pthread_mutex_unlock(&g_eventPool.commPoolLock);
+}
+
+/*
+ * Description:
+ *   Copy what a proxy operation needs from its collective parent. The record
+ *   may already be released (NCCL 2.31 can complete the kernel before the
+ *   proxy appends the operation); inside the quarantine window it is unchanged.
+ *
+ * Thread Safety:
+ *
+ *   Thread-safe.
+ *
+ * Return:
+ *
+ *   inspectorPoolRecordState - Live/Quarantined (view filled) or Expired.
+ *
+ */
+inspectorPoolRecordState inspectorEventPoolViewColl(
+    const struct inspectorCollInfo* collInfo, struct inspectorProxyParentView* view,
+    uint64_t* releasedAgeUsecs) {
+  const struct inspectorCollInfoPoolEntry* entry =
+    (const struct inspectorCollInfoPoolEntry*)((const char*)collInfo -
+                                               offsetof(struct inspectorCollInfoPoolEntry, obj));
+  *releasedAgeUsecs = 0;
+  pthread_mutex_lock(&g_eventPool.collPoolLock);
+  inspectorPoolRecordState state = poolRecordState(entry, releasedAgeUsecs);
+  if (state != inspectorPoolRecordExpired) {
+    view->func = collInfo->func;
+    view->sn = collInfo->sn;
+    view->msgSizeBytes = collInfo->msgSizeBytes;
+    view->algo = collInfo->algo;
+    view->proto = collInfo->proto;
+    view->identity = collInfo->parentIdentity;
+    view->applicationStep = collInfo->applicationStep;
+  }
+  pthread_mutex_unlock(&g_eventPool.collPoolLock);
+  return state;
+}
+
+/*
+ * Description:
+ *   P2P counterpart of inspectorEventPoolViewColl (no algo/proto/identity).
+ *
+ * Thread Safety:
+ *
+ *   Thread-safe.
+ *
+ */
+inspectorPoolRecordState inspectorEventPoolViewP2p(
+    const struct inspectorP2pInfo* p2pInfo, struct inspectorProxyParentView* view,
+    uint64_t* releasedAgeUsecs) {
+  const struct inspectorP2pInfoPoolEntry* entry =
+    (const struct inspectorP2pInfoPoolEntry*)((const char*)p2pInfo -
+                                              offsetof(struct inspectorP2pInfoPoolEntry, obj));
+  *releasedAgeUsecs = 0;
+  pthread_mutex_lock(&g_eventPool.p2pPoolLock);
+  inspectorPoolRecordState state = poolRecordState(entry, releasedAgeUsecs);
+  if (state != inspectorPoolRecordExpired) {
+    view->func = p2pInfo->func;
+    view->sn = p2pInfo->sn;
+    view->msgSizeBytes = p2pInfo->msgSizeBytes;
+    view->applicationStep = p2pInfo->applicationStep;
+  }
+  pthread_mutex_unlock(&g_eventPool.p2pPoolLock);
+  return state;
+}
+
+uint64_t inspectorEventPoolQuarantineEvictions() {
+  pthread_mutex_lock(&g_eventPool.collPoolLock);
+  uint64_t evictions = g_eventPool.collQuarantineEvictions;
+  pthread_mutex_unlock(&g_eventPool.collPoolLock);
+  pthread_mutex_lock(&g_eventPool.p2pPoolLock);
+  evictions += g_eventPool.p2pQuarantineEvictions;
+  pthread_mutex_unlock(&g_eventPool.p2pPoolLock);
+  return evictions;
+}
+
+uint64_t inspectorEventPoolQuarantineUsecs() {
+  return g_eventPool.quarantineUsecs;
 }

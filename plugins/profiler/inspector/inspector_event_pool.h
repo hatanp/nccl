@@ -7,16 +7,23 @@
 #include "inspector.h"
 
 // Memory pool entry structures
+// Released collective and P2P records stay unchanged in a FIFO quarantine for
+// NCCL_INSPECTOR_POOL_QUARANTINE_MS before reuse: on NCCL 2.31 a proxy
+// operation can start after its parent's kernel completion released the record.
 struct inspectorCollInfoPoolEntry {
   struct inspectorCollInfo obj;
   struct inspectorCollInfoPoolEntry* next;
   bool inUse;
+  bool quarantined;
+  uint64_t releasedUsecs;
 };
 
 struct inspectorP2pInfoPoolEntry {
   struct inspectorP2pInfo obj;
   struct inspectorP2pInfoPoolEntry* next;
   bool inUse;
+  bool quarantined;
+  uint64_t releasedUsecs;
 };
 
 struct inspectorCommInfoPoolEntry {
@@ -36,6 +43,9 @@ struct inspectorEventPool {
   // Collective info pool
   struct inspectorPoolChunk* collChunkList;
   struct inspectorCollInfoPoolEntry* collFreeList;
+  struct inspectorCollInfoPoolEntry* collQuarantineHead;
+  struct inspectorCollInfoPoolEntry* collQuarantineTail;
+  uint64_t collQuarantineEvictions;
   uint32_t collStrideSize;
   uint32_t collTotalSize;
   uint32_t collAllocCount;
@@ -45,6 +55,9 @@ struct inspectorEventPool {
   // P2P info pool
   struct inspectorPoolChunk* p2pChunkList;
   struct inspectorP2pInfoPoolEntry* p2pFreeList;
+  struct inspectorP2pInfoPoolEntry* p2pQuarantineHead;
+  struct inspectorP2pInfoPoolEntry* p2pQuarantineTail;
+  uint64_t p2pQuarantineEvictions;
   uint32_t p2pStrideSize;
   uint32_t p2pTotalSize;
   uint32_t p2pAllocCount;
@@ -63,6 +76,27 @@ struct inspectorEventPool {
   // Controls whether pools are allowed to grow beyond their initial size.
   // Disabled via NCCL_INSPECTOR_POOL_GROW=0.
   bool growEnabled;
+
+  // Quarantine window for released collective/P2P records (0: reuse at once).
+  uint64_t quarantineUsecs;
+};
+
+// What a proxy operation copies from its collective or P2P parent when it
+// starts. All fields are set when the parent starts and never change.
+struct inspectorProxyParentView {
+  const char* func;
+  uint64_t sn;
+  size_t msgSizeBytes;
+  const char* algo;                  // collective only
+  const char* proto;                 // collective only
+  inspectorParentIdentity identity;  // collective only
+  int64_t applicationStep;
+};
+
+enum inspectorPoolRecordState {
+  inspectorPoolRecordLive,         // in use: the parent is still running
+  inspectorPoolRecordQuarantined,  // released, unchanged inside the quarantine window
+  inspectorPoolRecordExpired       // released longer ago than the window (or never quarantined)
 };
 
 extern struct inspectorEventPool g_eventPool;
@@ -79,5 +113,18 @@ struct inspectorCommInfo* inspectorEventPoolAllocComm();
 void inspectorEventPoolReleaseColl(struct inspectorCollInfo* collInfo);
 void inspectorEventPoolReleaseP2p(struct inspectorP2pInfo* p2pInfo);
 void inspectorEventPoolReleaseComm(struct inspectorCommInfo* commInfo);
+
+// Copy a parent's fields under the pool lock unless the record has expired.
+// releasedAgeUsecs receives the time since release for a quarantined record.
+inspectorPoolRecordState inspectorEventPoolViewColl(
+  const struct inspectorCollInfo* collInfo, struct inspectorProxyParentView* view,
+  uint64_t* releasedAgeUsecs);
+inspectorPoolRecordState inspectorEventPoolViewP2p(
+  const struct inspectorP2pInfo* p2pInfo, struct inspectorProxyParentView* view,
+  uint64_t* releasedAgeUsecs);
+uint64_t inspectorEventPoolQuarantineEvictions();
+uint64_t inspectorEventPoolQuarantineUsecs();
+// Monotonic microsecond clock of the quarantine; tests may replace it.
+void inspectorEventPoolSetClock(uint64_t (*nowUsecs)());
 
 #endif // NCCL_INSPECTOR_EVENT_POOL_H_

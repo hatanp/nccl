@@ -25,6 +25,9 @@ struct inspectorFixedProxyPool {
 static inspectorFixedProxyPool<inspectorProxyOpInfo> gOpPool;
 static inspectorFixedProxyPool<inspectorProxyStepInfo> gStepPool;
 static std::atomic<uint64_t> gDetachedOps {0};
+static std::atomic<uint64_t> gParentLateOps {0};
+static std::atomic<uint64_t> gParentLateMaxUsecs {0};
+static std::atomic<uint64_t> gParentExpiredOps {0};
 
 template <typename T>
 static bool initializePool(inspectorFixedProxyPool<T>& pool, uint32_t capacity) {
@@ -78,6 +81,9 @@ inspectorResult_t inspectorProxyPoolInit(uint32_t opCapacity,
   if (opCapacity == 0 || stepCapacity == 0) return inspectorMemoryError;
   if (!initializePool(gOpPool, opCapacity)) return inspectorMemoryError;
   gDetachedOps.store(0, std::memory_order_relaxed);
+  gParentLateOps.store(0, std::memory_order_relaxed);
+  gParentLateMaxUsecs.store(0, std::memory_order_relaxed);
+  gParentExpiredOps.store(0, std::memory_order_relaxed);
   if (!initializePool(gStepPool, stepCapacity)) {
     free(gOpPool.entries);
     gOpPool.entries = nullptr;
@@ -122,4 +128,24 @@ void inspectorProxyPoolRecordDetachedOp() {
 }
 uint64_t inspectorProxyPoolDetachedOps() {
   return gDetachedOps.load(std::memory_order_relaxed);
+}
+void inspectorProxyPoolRecordParentLate(uint64_t releasedAgeUsecs) {
+  gParentLateOps.fetch_add(1, std::memory_order_relaxed);
+  uint64_t current = gParentLateMaxUsecs.load(std::memory_order_relaxed);
+  while (releasedAgeUsecs > current
+         && !gParentLateMaxUsecs.compare_exchange_weak(current, releasedAgeUsecs,
+                                                       std::memory_order_relaxed)) {
+  }
+}
+uint64_t inspectorProxyPoolParentLateOps() {
+  return gParentLateOps.load(std::memory_order_relaxed);
+}
+uint64_t inspectorProxyPoolParentLateMaxUsecs() {
+  return gParentLateMaxUsecs.load(std::memory_order_relaxed);
+}
+void inspectorProxyPoolRecordParentExpired() {
+  gParentExpiredOps.fetch_add(1, std::memory_order_relaxed);
+}
+uint64_t inspectorProxyPoolParentExpiredOps() {
+  return gParentExpiredOps.load(std::memory_order_relaxed);
 }

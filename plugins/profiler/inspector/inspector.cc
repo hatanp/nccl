@@ -898,6 +898,7 @@ static void showInspectorEnvVars() {
     {"NCCL_INSPECTOR_P2P_POOL_SIZE", getenv("NCCL_INSPECTOR_P2P_POOL_SIZE"), "256", "P2P pool initial size/stride"},
     {"NCCL_INSPECTOR_COMM_POOL_SIZE", getenv("NCCL_INSPECTOR_COMM_POOL_SIZE"), "256", "Comm pool initial size/stride"},
     {"NCCL_INSPECTOR_POOL_GROW", getenv("NCCL_INSPECTOR_POOL_GROW"), "1", "Enable/disable dynamic growth of event pools"},
+    {"NCCL_INSPECTOR_POOL_QUARANTINE_MS", getenv("NCCL_INSPECTOR_POOL_QUARANTINE_MS"), "1000", "Keep released collective/P2P records unchanged this long before reuse (late proxy parents)"},
     {"NCCL_INSPECTOR_REQUIRE_KERNEL_TIMING", getenv("NCCL_INSPECTOR_REQUIRE_KERNEL_TIMING"), "1", "Require GPU-based kernel timing; discard events with CPU-measured timing"},
   };
 
@@ -1722,6 +1723,7 @@ void inspectorUpdateCollPerf(struct inspectorCompletedOpInfo *completedOp,
   completedOp->isP2p = false;
   completedOp->func = ncclStringToFunc(collInfo->func);
   completedOp->sn = collInfo->sn;
+  completedOp->applicationStep = collInfo->applicationStep;
   completedOp->timestampUsec = collInfo->tsCompletedUsec
       ? collInfo->tsCompletedUsec : inspectorGetTime();
   completedOp->msgSizeBytes = collInfo->msgSizeBytes;
@@ -1810,6 +1812,7 @@ void inspectorUpdateP2pPerf(struct inspectorCompletedOpInfo *completedOp,
   completedOp->isP2p = true;
   completedOp->func = ncclStringToFunc(p2pInfo->func);
   completedOp->sn = p2pInfo->sn;
+  completedOp->applicationStep = p2pInfo->applicationStep;
   completedOp->timestampUsec = p2pInfo->tsCompletedUsec
       ? p2pInfo->tsCompletedUsec : inspectorGetTime();
   completedOp->msgSizeBytes = p2pInfo->msgSizeBytes;

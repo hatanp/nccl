@@ -321,6 +321,10 @@ static void inspectorPluginCollInfoInit(struct inspectorCollInfo **collInfo,
     inspectorPluginCollInfoRef(collInfoPtr); //extra ref for kernel completion
   }
   collInfoPtr->tsStartUsec = inspectorGetTime();
+  // The task event starts in the plan's host callback, inside its own step. NCCL
+  // 2.31 delivers the kernel completion later from its profiler thread, possibly
+  // after the application has moved to the next step.
+  collInfoPtr->applicationStep = inspectorPromCurrentStep();
   collInfoPtr->msgSizeBytes =
     ncclTypeSize(inspectorStringToDatatype(eDescr->coll.datatype)) * eDescr->coll.count;
 
@@ -354,6 +358,7 @@ static void inspectorPluginP2pInfoInit(struct inspectorP2pInfo **p2pInfo,
     inspectorPluginP2pInfoRef(p2pInfoPtr); // extra ref for kernel completion
   }
   p2pInfoPtr->tsStartUsec = inspectorGetTime();
+  p2pInfoPtr->applicationStep = inspectorPromCurrentStep();
   p2pInfoPtr->msgSizeBytes =
     ncclTypeSize(inspectorStringToDatatype(eDescr->p2p.datatype)) * eDescr->p2p.count;
 
@@ -488,9 +493,9 @@ static void inspectorPluginProxyOpInfoInit(
     struct inspectorCommInfo* commInfo) {
   *proxyOp = nullptr;
   if (!enableNcclInspectorProxyStep) return;
-  int64_t applicationStep = inspectorPromCurrentStep();
-  if (applicationStep < 0) return;
+  const int64_t currentStep = inspectorPromCurrentStep();
   bool detached = eDescr->proxyOp.pid != getpid();
+  if (detached && currentStep < 0) return;
   // PXN can execute an operation in a different process. In that case the
   // parentObj and profiler context values belong to the originating address
   // space and must never be dereferenced here. Retain proxy phases in a
@@ -505,23 +510,25 @@ static void inspectorPluginProxyOpInfoInit(
   event->channelId = eDescr->proxyOp.channelId;
   event->peer = eDescr->proxyOp.peer;
   event->isSend = eDescr->proxyOp.isSend;
-  event->applicationStep = applicationStep;
+  event->applicationStep = currentStep;
   event->detached = detached ? 1 : 0;
+  // Fallback identity: what the proxy descriptor itself says.
+  event->func = event->isSend ? ncclFuncSend : ncclFuncRecv;
+  if (eDescr->proxyOp.nSteps > 0 && eDescr->proxyOp.chunkSize > 0
+      && static_cast<size_t>(eDescr->proxyOp.nSteps)
+           <= SIZE_MAX / static_cast<size_t>(eDescr->proxyOp.chunkSize)) {
+    event->messageSizeBytes =
+      static_cast<size_t>(eDescr->proxyOp.nSteps)
+      * static_cast<size_t>(eDescr->proxyOp.chunkSize);
+  }
+  snprintf(event->proto, sizeof(event->proto), "%s", "unknown");
   if (detached) {
     inspectorProxyPoolRecordDetachedOp();
-    event->func = event->isSend ? ncclFuncSend : ncclFuncRecv;
-    if (eDescr->proxyOp.nSteps > 0 && eDescr->proxyOp.chunkSize > 0
-        && static_cast<size_t>(eDescr->proxyOp.nSteps)
-             <= SIZE_MAX / static_cast<size_t>(eDescr->proxyOp.chunkSize)) {
-      event->messageSizeBytes =
-        static_cast<size_t>(eDescr->proxyOp.nSteps)
-        * static_cast<size_t>(eDescr->proxyOp.chunkSize);
-    }
     snprintf(event->algo, sizeof(event->algo), "%s", "PXN");
-    snprintf(event->proto, sizeof(event->proto), "%s", "unknown");
     *proxyOp = event;
     return;
   }
+  snprintf(event->algo, sizeof(event->algo), "%s", "unknown");
   event->commInfo = commInfo;
   event->nranks = commInfo->nranks;
   event->nnodes = commInfo->nnodes;
@@ -531,50 +538,41 @@ static void inspectorPluginProxyOpInfoInit(
     return;
   }
   event->parentType = parentType;
-  event->parentObj = eDescr->parentObj;
-  if (parentType == ncclProfileColl) {
-    inspectorCollInfo* parent = static_cast<inspectorCollInfo*>(eDescr->parentObj);
-    if (parent->type != ncclProfileColl) {
-      inspectorProxyPoolReleaseOp(event);
-      return;
-    }
-    inspectorPluginCollInfoRef(parent);
-    event->func = ncclStringToFunc(parent->func);
-    event->sequence = parent->sn;
-    event->parentIdentityId = parent->parentIdentity.id;
-    event->messageSizeBytes = parent->msgSizeBytes;
-    snprintf(event->algo, sizeof(event->algo), "%s",
-             parent->algo ? parent->algo : "unknown");
-    snprintf(event->proto, sizeof(event->proto), "%s",
-             parent->proto ? parent->proto : "unknown");
+  // Copy the parent's fields now and keep no reference to it. On NCCL 2.31 the
+  // profiler thread can complete the parent's kernels, and so release its record,
+  // before the proxy thread appends this operation; the pool keeps released
+  // records unchanged for its quarantine window (NCCL_INSPECTOR_POOL_QUARANTINE_MS).
+  inspectorProxyParentView view{};
+  uint64_t releasedAgeUsecs = 0;
+  inspectorPoolRecordState state = parentType == ncclProfileColl
+    ? inspectorEventPoolViewColl(static_cast<inspectorCollInfo*>(eDescr->parentObj),
+                                 &view, &releasedAgeUsecs)
+    : inspectorEventPoolViewP2p(static_cast<inspectorP2pInfo*>(eDescr->parentObj),
+                                &view, &releasedAgeUsecs);
+  if (state == inspectorPoolRecordExpired) {
+    inspectorProxyPoolRecordParentExpired();
   } else {
-    inspectorP2pInfo* parent = static_cast<inspectorP2pInfo*>(eDescr->parentObj);
-    if (parent->type != ncclProfileP2p) {
-      inspectorProxyPoolReleaseOp(event);
-      return;
+    if (state == inspectorPoolRecordQuarantined) {
+      inspectorProxyPoolRecordParentLate(releasedAgeUsecs);
     }
-    inspectorPluginP2pInfoRef(parent);
-    event->func = ncclStringToFunc(parent->func);
-    event->sequence = parent->sn;
-    event->messageSizeBytes = parent->msgSizeBytes;
+    event->parentKnown = 1;
+    event->func = ncclStringToFunc(view.func);
+    event->sequence = view.sn;
+    event->messageSizeBytes = view.msgSizeBytes;
+    // The proxy can start after the application moved on; keep the parent's step.
+    if (view.applicationStep >= 0) event->applicationStep = view.applicationStep;
+    if (parentType == ncclProfileColl) {
+      event->parentMetadata = view.identity;
+      event->parentIdentityId = view.identity.id;
+      snprintf(event->algo, sizeof(event->algo), "%s", view.algo ? view.algo : "unknown");
+      snprintf(event->proto, sizeof(event->proto), "%s", view.proto ? view.proto : "unknown");
+    }
+  }
+  if (event->applicationStep < 0) {
+    inspectorProxyPoolReleaseOp(event);
+    return;
   }
   *proxyOp = event;
-}
-
-static void inspectorPluginProxyOpParentRelease(inspectorProxyOpInfo* proxyOp) {
-  if (proxyOp == nullptr || proxyOp->parentObj == nullptr) return;
-  bool needsCleanup = false;
-  if (proxyOp->parentType == ncclProfileColl) {
-    inspectorCollInfo* parent =
-      static_cast<inspectorCollInfo*>(proxyOp->parentObj);
-    needsCleanup = inspectorPluginCollInfoDeRef(parent) == inspectorReturn;
-    if (needsCleanup) inspectorPluginCollInfoCleanup(parent);
-  } else if (proxyOp->parentType == ncclProfileP2p) {
-    inspectorP2pInfo* parent =
-      static_cast<inspectorP2pInfo*>(proxyOp->parentObj);
-    needsCleanup = inspectorPluginP2pInfoDeRef(parent) == inspectorReturn;
-    if (needsCleanup) inspectorPluginP2pInfoCleanup(parent);
-  }
 }
 
 static void inspectorPluginProxyStepInfoInit(
@@ -980,7 +978,7 @@ __hidden ncclResult_t inspectorPluginStopEvent(void *eHandle) {
             peak.channel = parent->channelId;
             peak.peer = parent->peer;
             peak.transferStep = proxyStep->transferStep;
-            peak.identityKnown = !parent->detached;
+            peak.identityKnown = !parent->detached && parent->parentKnown;
             inspectorProxySelectPeak(parent->phasePeaks[phase], peak);
           }
         } else {
@@ -992,7 +990,6 @@ __hidden ncclResult_t inspectorPluginStopEvent(void *eHandle) {
   } else if (type == ncclProfileProxyOp) {
     inspectorProxyOpInfo* proxyOp = static_cast<inspectorProxyOpInfo*>(eHandle);
     inspectorPromRecordProxyOp(proxyOp);
-    inspectorPluginProxyOpParentRelease(proxyOp);
     inspectorProxyPoolReleaseOp(proxyOp);
   }
   return ncclSuccess;

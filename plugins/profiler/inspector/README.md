@@ -464,3 +464,24 @@ NCCL 2.31 runs that KernelCh progress on one profiler thread per communicator
 `NCCL_SET_THREAD_NAME=1`, the Inspector names it `NCCL Profiler` on its first
 KernelCh start, so per-thread samplers can measure its CPU time; threads that
 already carry an NCCL name keep it.
+
+Per-step rows (`# nccl_inspector_step`) count each collective and P2P
+operation in the application step that was current when its task event
+started (`ncclInspectorStepBegin`/`ncclInspectorStepEnd`). On NCCL 2.31 the
+kernel completion arrives later from the profiler thread and can be processed
+after the step has ended; it still counts in its own step.
+
+On NCCL 2.31 the proxy thread can append a collective's or P2P operation's
+network work after the profiler thread has completed its kernels and the
+Inspector has released the parent record. Proxy operations therefore copy
+everything they need from the parent when they start (identity, sequence,
+size, algorithm, parent metadata and step) and keep no reference to it.
+Released collective and P2P records stay unchanged for
+`NCCL_INSPECTOR_POOL_QUARANTINE_MS` (default `1000`; `0` reuses them at once)
+before the pool hands them out again, so a late proxy start still reads its
+own parent. `# nccl_inspector_step_proxy_info` reports `parent_late_ops` and
+`parent_late_max_us` (starts after the parent's release, inside the window),
+`parent_expired_ops` (after the window: phases kept without parent identity,
+in the step current at the proxy start), `pool_quarantine_ms` and
+`pool_quarantine_evictions` (records reused early because the pool could not
+grow; non-zero means late identities are not guaranteed).

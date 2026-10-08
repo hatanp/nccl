@@ -160,6 +160,7 @@ struct inspectorCompletedOpInfo {
   char algo[NCCL_INSPECTOR_ALGO_NAME_MAX];   // coll only
   char proto[NCCL_INSPECTOR_PROTO_NAME_MAX]; // coll only
   int peer;           // P2P only (unused for coll)
+  int64_t applicationStep; // step current at the operation's start; -1 outside a step
   struct inspectorEventTrkOpInfo evtTrk;
 };
 
@@ -247,7 +248,8 @@ struct inspectorProxyOpInfo {
   uint64_t parentIdentityId;
   struct inspectorCommInfo* commInfo;
   uint64_t parentType;
-  void* parentObj;
+  inspectorParentIdentity parentMetadata;  // copied from the parent at start
+  int parentKnown;  // parent fields copied (live or quarantined parent record)
   int detached;
   ncclFunc_t func;
   uint64_t sequence;
@@ -299,6 +301,7 @@ struct inspectorCollInfo {
   uint32_t nChannels;
   uint32_t nKernelChStarted;
   uint32_t nKernelChCompleted;
+  int64_t applicationStep;
   pthread_rwlock_t guard;
   struct inspectorKernelChInfo kernelCh[MAX_CHANNELS];
   struct inspectorEventTrkOpInfo collEvtTrk;
@@ -316,6 +319,7 @@ struct inspectorP2pInfo {
   uint32_t nChannels;
   uint32_t nKernelChStarted;
   uint32_t nKernelChCompleted;
+  int64_t applicationStep;
   pthread_rwlock_t guard;
   struct inspectorKernelChInfo kernelCh[MAX_CHANNELS];
   struct inspectorEventTrkOpInfo p2pEvtTrk;

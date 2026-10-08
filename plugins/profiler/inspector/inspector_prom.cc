@@ -10,6 +10,7 @@
 #include "inspector_cudawrap.h"
 #include "inspector_prom_stats.h"
 #include "inspector_proxy_pool.h"
+#include "inspector_event_pool.h"
 #include "inspector_proxy_stats.h"
 #include "inspector_ring.h"
 #include "profiler.h"
@@ -338,15 +339,17 @@ int ncclInspectorStepEnd(int64_t step, uint64_t wallTimeNs) {
 static void inspectorPromStepUpdate(inspectorPromDevice& device,
                                     const inspectorCommInfo* commInfo,
                                     const inspectorCompletedOpInfo& op) {
-  int64_t currentStep = gInspectorPromCurrentStep.load(std::memory_order_relaxed);
-  if (!inspectorPromStepEnabled() || currentStep < 0) return;
+  // The step current when the operation started, not when its completion is
+  // processed (NCCL 2.31's profiler thread can lag behind step boundaries).
+  const int64_t step = op.applicationStep;
+  if (!inspectorPromStepEnabled() || step < 0) return;
   inspectorPromTopologySizes sizes = inspectorPromGetTopologySizes();
   // Keep the original bins and event eligibility; semantic labels are applied
   // only at emission so counts, timing unions and interval policy do not change.
   inspectorPromSemanticFamily family = inspectorPromClassifySizeFamily(
     op.isP2p, commInfo->nranks, commInfo->nnodes, sizes);
   if (family == inspectorPromFamilyUnknown) return;
-  inspectorPromStepFamilyKey key {currentStep, family, op.func};
+  inspectorPromStepFamilyKey key {step, family, op.func};
   inspectorPromStepFamilyAgg& agg = device.stepFamilies[key];
   uint64_t operationStartUsecs;
   uint64_t operationStopUsecs;
@@ -368,7 +371,7 @@ static void inspectorPromStepUpdate(inspectorPromDevice& device,
   }
   if (op.isP2p && family == inspectorPromFamilyPpCrossNode) {
     std::vector<inspectorPromStepP2pEvent>& events
-      = device.stepP2pEvents[currentStep];
+      = device.stepP2pEvents[step];
     if (events.size() < inspectorPromStepP2pCapacity()) {
       events.push_back(inspectorPromStepP2pEvent {
         op.func,
@@ -385,7 +388,7 @@ static void inspectorPromStepUpdate(inspectorPromDevice& device,
         op.timingSource
       });
     } else {
-      device.stepP2pDropped[currentStep]++;
+      device.stepP2pDropped[step]++;
     }
   }
 }
@@ -431,11 +434,11 @@ inspectorResult_t inspectorPromRecordProxyOp(
   }
   inspectorPromStepProxyAgg& agg = *aggPtr;
   inspectorParentIdentity parentIdentity{};
-  // The local parent reference is released only after this function returns.
-  // Detached PXN never dereferences its foreign parent/context values.
-  if (enableNcclInspectorParentIdentity && !op->detached
-      && op->parentType == ncclProfileColl && op->parentObj != nullptr) {
-    parentIdentity = static_cast<const inspectorCollInfo*>(op->parentObj)->parentIdentity;
+  // Copied from the local parent when the proxy operation started. Detached PXN
+  // never dereferences its foreign parent/context values.
+  if (enableNcclInspectorParentIdentity && !op->detached && op->parentKnown
+      && op->parentType == ncclProfileColl) {
+    parentIdentity = op->parentMetadata;
   }
   agg.count += op->proxyStepCount;
   agg.transferBytes += op->transferSizeBytes;
@@ -1425,6 +1428,9 @@ static inspectorResult_t inspectorPromWriteStepProxy(
     "# nccl_inspector_step_proxy_info {\"records\":%zu,"
     "\"dropped_ops\":%" PRIu64 ",\"dropped_steps\":%" PRIu64
     ",\"detached_ops\":%" PRIu64
+    ",\"parent_late_ops\":%" PRIu64 ",\"parent_late_max_us\":%" PRIu64
+    ",\"parent_expired_ops\":%" PRIu64 ",\"pool_quarantine_ms\":%" PRIu64
+    ",\"pool_quarantine_evictions\":%" PRIu64
     ",\"peak_schema\":1,\"peak_enabled\":%s"
     ",\"parent_identity_schema\":1,\"parent_identity_enabled\":%s"
     ",\"parent_process_instance\":\"%s\",\"parent_dictionary_capacity\":%zu"
@@ -1435,7 +1441,10 @@ static inspectorResult_t inspectorPromWriteStepProxy(
     "\"send_wait\",\"recv_wait\",\"recv_flush_wait\","
     "\"recv_gpu_wait\"]}\n",
     proxy.size(), inspectorProxyPoolDroppedOps(), inspectorProxyPoolDroppedSteps(),
-    inspectorProxyPoolDetachedOps(), enableNcclInspectorProxyPeak ? "true" : "false",
+    inspectorProxyPoolDetachedOps(), inspectorProxyPoolParentLateOps(),
+    inspectorProxyPoolParentLateMaxUsecs(), inspectorProxyPoolParentExpiredOps(),
+    inspectorEventPoolQuarantineUsecs() / 1000, inspectorEventPoolQuarantineEvictions(),
+    enableNcclInspectorProxyPeak ? "true" : "false",
     enableNcclInspectorParentIdentity ? "true" : "false", parentInstance,
     parentCapacity, parents.available(), parentUnavailablePeaks,
     sizes.world, sizes.dp, sizes.edp,
