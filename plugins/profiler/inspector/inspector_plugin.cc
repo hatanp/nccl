@@ -20,6 +20,7 @@
 #include "inspector_ring.h"
 #include "inspector_event_pool.h"
 #include "inspector_proxy_pool.h"
+#include "inspector_thread_name.h"
 
 #define __hidden __attribute__ ((visibility("hidden")))
 
@@ -673,6 +674,7 @@ __hidden ncclResult_t inspectorPluginStartEvent(void* context,
     inspectorPluginP2pInfoInit(&p2pEvent, eDescr, commInfoCtx);
     *eHandle = p2pEvent;
   } else if (eDescr->type == ncclProfileKernelCh) {
+    inspectorNameProfilerThreadOnce();
     struct inspectorKernelChInfo *kernelChEvent = nullptr;
     inspectorPluginKernelChInfoInit(&kernelChEvent, eDescr);
     *eHandle = kernelChEvent;

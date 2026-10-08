@@ -79,7 +79,7 @@ OBJS := $(SRCS:%.cc=$(OBJDIR)/%.o)
 TARGET := libnccl-profiler-inspector.so
 
 # Build rules
-.PHONY: all clean help check-cuda test-ring test-prom-stats test-proxy-stats test-proxy-pool test-proxy-lifecycle test-parent-identity
+.PHONY: all clean help check-cuda test-ring test-prom-stats test-proxy-stats test-proxy-pool test-proxy-lifecycle test-parent-identity test-thread-name
 
 all: check-cuda $(TARGET)
 
@@ -112,6 +112,12 @@ test-parent-identity:
 		tests/inspector_parent_identity_test.cc inspector_parent_identity.cc -o inspector_parent_identity_test
 	./inspector_parent_identity_test
 	rm -f inspector_parent_identity_test
+
+test-thread-name:
+	$(CXX) $(CXXSTD) -Wall -Wextra -pthread $(INCLUDES) \
+		tests/inspector_thread_name_test.cc -o inspector_thread_name_test
+	./inspector_thread_name_test
+	rm -f inspector_thread_name_test
 
 test-proxy-lifecycle: all
 	$(CXX) $(CXXSTD) -Wall -Wextra $(INCLUDES) \
@@ -191,6 +197,7 @@ help:
 	@echo "  clean   - Clean build artifacts"
 	@echo "  help    - Show this help"
 	@echo "  test-ring - Run the host-only completed-ring unit test"
+	@echo "  test-thread-name - Run the profiler-thread naming unit test"
 	@echo ""
 	@echo "Options:"
 	@echo "  DEBUG=1                      - Enable debug build"

@@ -458,3 +458,9 @@ eager call. NCCL 2.31 posts the KernelCh work counters from the plan's host
 callback instead, once per eager launch and once per graph replay, mirroring
 the device kernel. This branch therefore carries no core change; native replay
 qualification of the counters is still required.
+
+NCCL 2.31 runs that KernelCh progress on one profiler thread per communicator
+(fewer when communicators share resources), which NCCL does not name. With
+`NCCL_SET_THREAD_NAME=1`, the Inspector names it `NCCL Profiler` on its first
+KernelCh start, so per-thread samplers can measure its CPU time; threads that
+already carry an NCCL name keep it.
